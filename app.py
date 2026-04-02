@@ -81,26 +81,17 @@ def generate_glitch_audio(
     sr: int = 44100
 ) -> np.ndarray:
     """
+    Sintesi vettorizzata – nessun loop Python, usa NumPy per tutto.
     Ritorna array stereo float32 shape (2, N).
-
-    Parametri in `params`:
-        v_orig_vol  – volume dell'audio originale nel mix finale (0..1)
-        v_mix       – scala l'intensità dello strato glitch granulare (0..5)
-        grit        – quantizzazione bitcrush: 0=nessuna, 1=massima (0..1)
-        g_size      – durata massima di un grano in secondi (0.01..0.5)
-        intensity   – moltiplica l'energia video → più o meno glitch (0..2)
-        drone_vol   – volume del drone 55 Hz (0..1)
-        seed        – seed numpy per riproducibilità
     """
     np.random.seed(int(params["seed"]))
     N = int(duration * sr)
 
-    # ── Caricamento audio sorgente dal video ──────────────────────────────────
+    # ── Caricamento audio sorgente ────────────────────────────────────────────
     try:
         src, _ = librosa.load(video_path, sr=sr, mono=False)
         if src.ndim == 1:
-            src = np.tile(src, (2, 1))          # mono → stereo duplicato
-        # adatta lunghezza
+            src = np.tile(src, (2, 1))
         if src.shape[1] < N:
             src = np.pad(src, ((0, 0), (0, N - src.shape[1])))
         else:
@@ -108,49 +99,61 @@ def generate_glitch_audio(
     except Exception:
         src = np.zeros((2, N), dtype=np.float32)
 
-    # ── Mappa energia (frame) → campioni audio ────────────────────────────────
+    # ── Mappa energia video → campioni audio ──────────────────────────────────
     e_map = np.interp(
         np.linspace(0, 1, N),
         np.linspace(0, 1, len(energy)),
         energy
     ).astype(np.float32)
 
-    # ── Strato A: sintesi granulare ───────────────────────────────────────────
-    glitch_layer = np.zeros((2, N), dtype=np.float32)
-    step = 0.005        # passo temporale tra grani: 5 ms
+    # ── Strato A: glitch granulare vettorizzato ───────────────────────────────
+    # Invece di iterare ogni 5ms, scegliamo N_GRAINS posizioni di partenza
+    # casuali e le sommiamo in un'unica operazione vettoriale.
+    intensity  = params["intensity"]
+    v_mix      = params["v_mix"]
+    grit       = params["grit"]
     g_size_max = params["g_size"]
-    v_mix = params["v_mix"]
-    grit = params["grit"]
-    intensity = params["intensity"]
+    G_LEN      = int(sr * g_size_max)          # lunghezza fissa per la vettorizzazione
+    N_GRAINS   = int(duration / 0.005)         # ~1 grano ogni 5ms (come prima)
 
-    for t in np.arange(0, duration - 0.05, step):
-        i = int(t * sr)
-        power = e_map[i] * intensity
+    # Posizioni di partenza dei grani (campioni)
+    starts = np.random.randint(0, max(1, N - G_LEN), size=N_GRAINS)
+    # Energia in quel punto → "power" del grano
+    powers = e_map[starts] * intensity
 
-        # Attiva il grano se c'è abbastanza energia OPPURE con probabilità 5%
-        # (il 5% garantisce un minimo di glitch anche in zone quiete)
-        if power <= 0.02 and np.random.random() >= 0.05:
-            continue
+    # Teniamo solo i grani sopra soglia o con probabilità 5%
+    keep = (powers > 0.02) | (np.random.random(N_GRAINS) < 0.05)
+    starts = starts[keep]
+    powers = powers[keep]
 
-        g_len = int(sr * np.random.uniform(0.01, g_size_max))
-        if i + g_len >= N:
-            continue
+    # Costruiamo la matrice dei grani: shape (n_kept, G_LEN)
+    idx_matrix = (starts[:, None] + np.arange(G_LEN)).clip(0, N - 1)  # (K, G_LEN)
+    grains_l = src[0][idx_matrix]   # canale L
+    grains_r = src[1][idx_matrix]   # canale R
 
-        grain = src[:, i : i + g_len].copy()
+    # Bitcrush vettorizzato
+    if grit > 0:
+        steps = max(2, int(2 + (1.0 - grit) * 16))
+        grains_l = np.round(grains_l * steps) / steps
+        grains_r = np.round(grains_r * steps) / steps
 
-        # Strato B: bitcrush ──────────────────────────────────────────────────
-        # Riduce i "livelli" disponibili → distorsione digitale/lo-fi
-        if grit > 0:
-            steps = max(2, int(2 + (1.0 - grit) * 16))
-            grain = np.round(grain * steps) / steps
+    # Inviluppo Hanning (evita click)
+    env = np.hanning(G_LEN).astype(np.float32)             # (G_LEN,)
+    scale = (powers + 0.1)[:, None] * env * v_mix          # (K, G_LEN)
+    grains_l *= scale
+    grains_r *= scale
 
-        # Inviluppo hanning: evita click tra grani sovrapposti
-        env = np.hanning(g_len)
-        glitch_layer[:, i : i + g_len] += grain * env * v_mix * (power + 0.1)
+    # Accumulo: add.at è lento, usiamo np.zeros + bincount trick per L/R
+    glitch_l = np.zeros(N, dtype=np.float32)
+    glitch_r = np.zeros(N, dtype=np.float32)
+    flat_idx = idx_matrix.ravel()                           # (K*G_LEN,)
+    np.add.at(glitch_l, flat_idx, grains_l.ravel())
+    np.add.at(glitch_r, flat_idx, grains_r.ravel())
+    glitch_layer = np.stack([glitch_l, glitch_r])           # (2, N)
 
-    # ── Strato C: drone 55 Hz ─────────────────────────────────────────────────
-    t_axis = np.linspace(0, duration, N)
-    drone = np.sin(2 * np.pi * 55 * t_axis) * params["drone_vol"] * (0.2 + e_map)
+    # ── Strato C: drone 55 Hz modulato dall'energia ───────────────────────────
+    t_axis = np.linspace(0, duration, N, dtype=np.float32)
+    drone  = np.sin(2 * np.pi * 55 * t_axis) * params["drone_vol"] * (0.2 + e_map)
     drone_stereo = np.tile(drone, (2, 1))
 
     # ── Mix finale ────────────────────────────────────────────────────────────
