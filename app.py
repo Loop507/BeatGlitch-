@@ -91,16 +91,43 @@ def generate_glitch_audio(video_path, energy, scene_cuts, fps, duration, p, sr=4
     N = int(duration * sr)
 
     # ── Sorgente audio ──────────────────────────────────────────
+    src = None
     try:
-        src, _ = librosa.load(video_path, sr=sr, mono=False)
-        if src.ndim == 1:
-            src = np.tile(src, (2, 1))
-        if src.shape[1] < N:
-            src = np.pad(src, ((0,0),(0, N - src.shape[1])))
-        else:
-            src = src[:, :N]
+        raw, _ = librosa.load(video_path, sr=sr, mono=False)
+        if raw.ndim == 1:
+            raw = np.tile(raw, (2, 1))
+        # Considera "muto" se l'RMS è quasi zero
+        if np.sqrt(np.mean(raw**2)) > 1e-4:
+            src = raw
     except Exception:
-        src = np.zeros((2, N), dtype=np.float32)
+        pass
+
+    if src is None:
+        # VIDEO MUTO: sintetizziamo rumore colorato come sorgente
+        # White noise → filtrato passa-banda (200–8000 Hz) → texture granulare realistica
+        rng   = np.random.default_rng(int(p["seed"]))
+        noise = rng.standard_normal((2, N)).astype(np.float32)
+        # Passa-banda via FFT
+        freqs = np.fft.rfftfreq(N, d=1.0/sr)
+        mask  = ((freqs >= 200) & (freqs <= 8000)).astype(np.float32)
+        # Spettro rosa (1/f): enfatizza le basse frequenze del rumore
+        pink  = np.where(freqs > 0, 1.0 / np.sqrt(freqs + 1e-9), 1.0).astype(np.float32)
+        pink  = pink / pink.max()
+        for ch in range(2):
+            spec       = np.fft.rfft(noise[ch])
+            spec      *= mask * (0.5 + 0.5 * pink)   # mix white+pink filtrato
+            noise[ch]  = np.fft.irfft(spec, n=N).astype(np.float32)
+        # Normalizza a ampiezza ragionevole
+        mx = np.abs(noise).max()
+        if mx > 0:
+            noise /= mx
+        src = noise * 0.6   # volume sorgente sintetica
+
+    # Adatta lunghezza
+    if src.shape[1] < N:
+        src = np.pad(src, ((0,0),(0, N - src.shape[1])))
+    else:
+        src = src[:, :N]
 
     # ── Mappa energia frame → campioni ─────────────────────────
     e_map = np.interp(
