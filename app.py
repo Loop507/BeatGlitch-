@@ -1,198 +1,218 @@
-import streamlit as st
-import os
+"""
+BeatGlitch – Audio-Reactive Glitching
+======================================
+Dipendenze:
+    pip install opencv-python librosa soundfile moviepy numpy
+
+Uso:
+    python beatglitch.py --input video.mp4 --output glitch_out.mp4
+    python beatglitch.py --input video.mp4 --output glitch_out.mp4 --intensity 1.4 --grit 0.9
+"""
+
+import argparse
 import numpy as np
-import tempfile
 import cv2
 import librosa
 import soundfile as sf
-import json
+import tempfile
+import os
 from moviepy.editor import VideoFileClip, AudioFileClip
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  ANALISI ULTRA-SENSIBILE (PIXEL-PER-PIXEL)
+# 1. ANALISI VIDEO – energia frame-per-frame
+#    Confronta ogni frame col precedente (pixel diff).
+#    Output: array normalizzato [0.0 … 1.0], un valore per frame.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def analyze_video_v4(video_path):
+def analyze_video(video_path: str, res=(160, 120)) -> np.ndarray:
+    """
+    Calcola quanto 'cambia' ogni frame rispetto al precedente.
+    - Usa una risoluzione ridotta (160×120) per velocità.
+    - Score = media(diff) + std(diff): cattura sia il movimento medio
+      che il 'caos' locale (glitch, flash, tagli di scena).
+    - Normalizzazione su [0,1] + curva potenza 1.5 (enfatizza i picchi).
+    """
     cap = cv2.VideoCapture(video_path)
-    raw_scores = []
-    prev_frame = None
-    
+    scores = []
+    prev = None
+
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret: break
-        
-        # Analisi ad alta risoluzione (160x120) per catturare piccoli glitch
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        curr_gray = cv2.resize(curr_gray, (160, 120))
-        
-        if prev_frame is not None:
-            # Differenza assoluta tra i frame
-            diff = cv2.absdiff(curr_gray, prev_frame)
-            # Calcolo energia: media dei pixel cambiati + deviazione standard (caos)
-            score = np.mean(diff) + np.std(diff)
-            raw_scores.append(score)
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, res)
+
+        if prev is not None:
+            diff = cv2.absdiff(gray, prev)
+            scores.append(float(np.mean(diff) + np.std(diff)))
         else:
-            raw_scores.append(0)
-        prev_frame = curr_gray
-        
+            scores.append(0.0)
+        prev = gray
+
     cap.release()
-    
-    scores = np.array(raw_scores)
-    if len(scores) > 0 and np.max(scores) > 0:
-        # Normalizzazione: il punto più "movimentato" del video diventa 1.0
-        scores = scores / np.max(scores)
-        # Applichiamo una curva di risposta più naturale (esponenziale morbida)
-        scores = np.power(scores, 1.5)
+
+    arr = np.array(scores, dtype=np.float32)
+    mx = arr.max()
+    if mx > 0:
+        arr = arr / mx          # normalizza
+        arr = np.power(arr, 1.5) # curva: enfatizza i picchi
     else:
-        scores = np.ones(1) * 0.1 # Fallback se il video è statico
-    return scores
+        arr = np.full_like(arr, 0.1)  # video statico: energia piatta bassa
+
+    return arr
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MOTORE AUDIO REATTIVO
+# 2. SINTESI AUDIO GLITCH
+#    L'energia video pilota tre strati:
+#      A) Sintesi granulare reattiva  – frammenti ("grani") del suono originale
+#         riposizionati e distorti in base ai picchi video.
+#      B) Bitcrush (grit)             – quantizzazione del segnale → "grana".
+#      C) Drone 55 Hz                 – texture di basso sempre presente,
+#         modulata in ampiezza dall'energia video.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def generate_glitch_v4(video_path, energy_arr, duration, p, sr=44100):
-    np.random.seed(int(p['seed']))
-    total_samples = int(duration * sr)
-    
-    # Caricamento Audio Sorgente
+def generate_glitch_audio(
+    video_path: str,
+    energy: np.ndarray,
+    duration: float,
+    params: dict,
+    sr: int = 44100
+) -> np.ndarray:
+    """
+    Ritorna array stereo float32 shape (2, N).
+
+    Parametri in `params`:
+        v_orig_vol  – volume dell'audio originale nel mix finale (0..1)
+        v_mix       – scala l'intensità dello strato glitch granulare (0..5)
+        grit        – quantizzazione bitcrush: 0=nessuna, 1=massima (0..1)
+        g_size      – durata massima di un grano in secondi (0.01..0.5)
+        intensity   – moltiplica l'energia video → più o meno glitch (0..2)
+        drone_vol   – volume del drone 55 Hz (0..1)
+        seed        – seed numpy per riproducibilità
+    """
+    np.random.seed(int(params["seed"]))
+    N = int(duration * sr)
+
+    # ── Caricamento audio sorgente dal video ──────────────────────────────────
     try:
-        y_src, _ = librosa.load(video_path, sr=sr, mono=False)
-        if y_src.ndim == 1: y_src = np.tile(y_src, (2, 1))
-        # Trim o Pad per matchare la durata
-        if y_src.shape[1] < total_samples:
-            y_src = np.pad(y_src, ((0,0), (0, total_samples - y_src.shape[1])))
+        src, _ = librosa.load(video_path, sr=sr, mono=False)
+        if src.ndim == 1:
+            src = np.tile(src, (2, 1))          # mono → stereo duplicato
+        # adatta lunghezza
+        if src.shape[1] < N:
+            src = np.pad(src, ((0, 0), (0, N - src.shape[1])))
         else:
-            y_src = y_src[:, :total_samples]
-    except:
-        y_src = np.zeros((2, total_samples), dtype=np.float32)
+            src = src[:, :N]
+    except Exception:
+        src = np.zeros((2, N), dtype=np.float32)
 
-    # Mapping energia video su campioni audio
-    e_map = np.interp(np.linspace(0, 1, total_samples), 
-                      np.linspace(0, 1, len(energy_arr)), 
-                      energy_arr).astype(np.float32)
+    # ── Mappa energia (frame) → campioni audio ────────────────────────────────
+    e_map = np.interp(
+        np.linspace(0, 1, N),
+        np.linspace(0, 1, len(energy)),
+        energy
+    ).astype(np.float32)
 
-    audio_out = np.zeros((2, total_samples), dtype=np.float32)
-    
-    # Sintesi Glitch Granulare
-    grain_step = 0.005 # 5ms
-    for t in np.arange(0, duration - 0.05, grain_step):
-        idx = int(t * sr)
-        # Forza del glitch in questo istante
-        power = e_map[idx] * p['intensity']
-        
-        if power > 0.02 or np.random.random() < 0.05:
-            # Lunghezza grano influenzata dal video
-            g_len = int(sr * np.random.uniform(0.01, p['g_size']))
-            if idx + g_len >= total_samples: continue
-            
-            chunk = y_src[:, idx : idx + g_len].copy()
-            
-            # Bitcrush (Grit)
-            if p['grit'] > 0:
-                steps = int(2 + (1.0 - p['grit']) * 16)
-                chunk = np.round(chunk * steps) / steps
-            
-            # Applica Inviluppo e Volume Glitch
-            env = np.hanning(g_len)
-            audio_out[:, idx:idx+g_len] += chunk * env * p['v_mix'] * (power + 0.1)
+    # ── Strato A: sintesi granulare ───────────────────────────────────────────
+    glitch_layer = np.zeros((2, N), dtype=np.float32)
+    step = 0.005        # passo temporale tra grani: 5 ms
+    g_size_max = params["g_size"]
+    v_mix = params["v_mix"]
+    grit = params["grit"]
+    intensity = params["intensity"]
 
-    # Drone di sottofondo (sempre presente ma modulato dal video)
-    time_axis = np.linspace(0, duration, total_samples)
-    drone = np.sin(2 * np.pi * 55 * time_axis) * p['drone_vol'] * (0.2 + e_map)
-    audio_out += np.tile(drone, (2, 1))
+    for t in np.arange(0, duration - 0.05, step):
+        i = int(t * sr)
+        power = e_map[i] * intensity
 
-    # Mix Finale: Audio Originale + Glitch
-    final_mix = (y_src * p['v_orig_vol']) + (audio_out * 0.7)
-    return np.clip(final_mix, -1, 1)
+        # Attiva il grano se c'è abbastanza energia OPPURE con probabilità 5%
+        # (il 5% garantisce un minimo di glitch anche in zone quiete)
+        if power <= 0.02 and np.random.random() >= 0.05:
+            continue
+
+        g_len = int(sr * np.random.uniform(0.01, g_size_max))
+        if i + g_len >= N:
+            continue
+
+        grain = src[:, i : i + g_len].copy()
+
+        # Strato B: bitcrush ──────────────────────────────────────────────────
+        # Riduce i "livelli" disponibili → distorsione digitale/lo-fi
+        if grit > 0:
+            steps = max(2, int(2 + (1.0 - grit) * 16))
+            grain = np.round(grain * steps) / steps
+
+        # Inviluppo hanning: evita click tra grani sovrapposti
+        env = np.hanning(g_len)
+        glitch_layer[:, i : i + g_len] += grain * env * v_mix * (power + 0.1)
+
+    # ── Strato C: drone 55 Hz ─────────────────────────────────────────────────
+    t_axis = np.linspace(0, duration, N)
+    drone = np.sin(2 * np.pi * 55 * t_axis) * params["drone_vol"] * (0.2 + e_map)
+    drone_stereo = np.tile(drone, (2, 1))
+
+    # ── Mix finale ────────────────────────────────────────────────────────────
+    mix = (src * params["v_orig_vol"]) + (glitch_layer * 0.7) + drone_stereo
+    return np.clip(mix, -1.0, 1.0)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  INTERFACCIA STREAMLIT
+# 3. EXPORT – scrive il WAV e lo fonde con il video originale
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="BeatGlitch Studio V4", layout="wide")
+def render(video_path: str, output_path: str, params: dict, sr: int = 44100):
+    print(f"[1/3] Analisi video: {video_path}")
+    energy = analyze_video(video_path)
+    print(f"      Frames analizzati: {len(energy)}")
 
-def main():
-    st.title("🎬 BeatGlitch: Pixel-Reactivity V4")
-    
-    # Sidebar: File e Preset
-    with st.sidebar:
-        st.header("📂 Risorse")
-        v_file = st.file_uploader("Carica Video", type=["mp4", "mov"])
-        
-        st.markdown("---")
-        st.subheader("💾 Preset JSON")
-        up_json = st.file_uploader("Carica Preset", type="json")
-        
-        # Download Preset attuale
-        if st.button("Prepara Download Preset"):
-            curr = {
-                "v_orig_vol": st.session_state.get("v_orig_vol", 0.3),
-                "v_mix": st.session_state.get("v_mix", 1.5),
-                "grit": st.session_state.get("grit", 0.7),
-                "g_size": st.session_state.get("g_size", 0.1),
-                "intensity": st.session_state.get("intensity", 0.8),
-                "drone_vol": st.session_state.get("drone_vol", 0.15),
-                "seed": st.session_state.get("seed_val", 42)
-            }
-            st.download_button("Scarica Ora", json.dumps(curr), "preset.json")
+    clip = VideoFileClip(video_path)
+    duration = clip.duration
+    print(f"      Durata: {duration:.2f}s")
 
-    # Pannello Controlli
-    st.subheader("🎛️ Controlli Audio-Visivi")
-    
-    # Carichiamo i valori dal JSON se presente
-    ld = {}
-    if up_json:
-        try: ld = json.load(up_json)
-        except: pass
+    print("[2/3] Sintesi audio glitch...")
+    audio = generate_glitch_audio(video_path, energy, duration, params, sr)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        v_orig_vol = st.slider("Volume Originale Video", 0.0, 1.0, ld.get("v_orig_vol", 0.3), key="v_orig_vol")
-        v_mix = st.slider("Potenza Glitch Generato", 0.0, 5.0, ld.get("v_mix", 1.5), key="v_mix")
-    with col2:
-        grit = st.slider("Grit (Bitcrush/Distorsione)", 0.0, 1.0, ld.get("grit", 0.7), key="grit")
-        g_size = st.slider("Durata Micro-Glitch (s)", 0.01, 0.5, ld.get("g_size", 0.1), key="g_size")
-    with col3:
-        intensity = st.slider("Sensibilità ai Pixel", 0.0, 2.0, ld.get("intensity", 1.0), key="intensity")
-        drone_vol = st.slider("Volume Drone (Texture)", 0.0, 1.0, ld.get("drone_vol", 0.15), key="drone_vol")
-        seed = st.number_input("Seed", value=int(ld.get("seed", 42)), key="seed_val")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        wav_path = tf.name
+    sf.write(wav_path, audio.T, sr)   # soundfile vuole (N, 2)
 
-    # Esecuzione
-    if v_file:
-        t_v = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        t_v.write(v_file.read())
-        
-        if st.button("🚀 GENERA GLITCH ART", use_container_width=True):
-            try:
-                with st.spinner("Analisi differenze pixel in corso..."):
-                    energy = analyze_video_v4(t_v.name)
-                    clip = VideoFileClip(t_v.name)
-                    
-                    params = {
-                        "v_orig_vol": v_orig_vol, "v_mix": v_mix, "grit": grit,
-                        "g_size": g_size, "intensity": intensity, 
-                        "drone_vol": drone_vol, "seed": seed
-                    }
-                    
-                    audio_data = generate_glitch_v4(t_v.name, energy, clip.duration, params)
-                    
-                    # Export Audio
-                    t_a = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                    sf.write(t_a.name, audio_data.T, 44100)
-                    
-                    # Merge
-                    final_clip = clip.set_audio(AudioFileClip(t_a.name))
-                    out_f = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-                    final_clip.write_videofile(out_f, codec="libx264", audio_codec="aac")
-                    
-                    st.success("Sincronizzazione completata!")
-                    st.video(out_f)
-                    with open(out_f, "rb") as f:
-                        st.download_button("💾 Scarica Video Finale", f, "glitch_video.mp4")
-                clip.close()
-            except Exception as e:
-                st.error(f"Errore: {e}")
+    print(f"[3/3] Compositing → {output_path}")
+    final = clip.set_audio(AudioFileClip(wav_path))
+    final.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+
+    clip.close()
+    os.unlink(wav_path)
+    print("✅ Fatto!")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_PARAMS = {
+    "v_orig_vol": 0.3,   # volume audio originale
+    "v_mix":      1.5,   # intensità strato granulare
+    "grit":       0.7,   # bitcrush (0=pulito, 1=massimo)
+    "g_size":     0.1,   # durata max grano (s)
+    "intensity":  1.0,   # sensibilità all'energia video
+    "drone_vol":  0.15,  # volume drone 55 Hz
+    "seed":       42,    # riproducibilità
+}
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="BeatGlitch – audio-reactive glitching")
+    ap.add_argument("--input",      required=True,  help="Video sorgente (.mp4 / .mov)")
+    ap.add_argument("--output",     required=True,  help="Video output (.mp4)")
+    ap.add_argument("--v_orig_vol", type=float, default=DEFAULT_PARAMS["v_orig_vol"])
+    ap.add_argument("--v_mix",      type=float, default=DEFAULT_PARAMS["v_mix"])
+    ap.add_argument("--grit",       type=float, default=DEFAULT_PARAMS["grit"])
+    ap.add_argument("--g_size",     type=float, default=DEFAULT_PARAMS["g_size"])
+    ap.add_argument("--intensity",  type=float, default=DEFAULT_PARAMS["intensity"])
+    ap.add_argument("--drone_vol",  type=float, default=DEFAULT_PARAMS["drone_vol"])
+    ap.add_argument("--seed",       type=int,   default=DEFAULT_PARAMS["seed"])
+    args = ap.parse_args()
+
+    params = {k: getattr(args, k) for k in DEFAULT_PARAMS}
+    render(args.input, args.output, params)
