@@ -101,13 +101,14 @@ st.set_page_config(page_title="BeatGlitch Studio", layout="wide")
 def main():
     st.title("🎬 BeatGlitch Studio")
 
-    # Inizializzazione Session State
+    # 1. Inizializzazione Session State (Prima di tutto)
     defaults = {
         "drone_vol": 0.3, "v_mix": 0.5, "auto_m": 0.2, "grit": 0.6,
         "g_size": 0.4, "rnd_f": 0.5, "chaos": 0.5, "intensity": 0.7, "seed": 42
     }
     for k, v in defaults.items():
-        if k not in st.session_state: st.session_state[k] = v
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     # SIDEBAR
     with st.sidebar:
@@ -118,40 +119,22 @@ def main():
         st.header("🎭 Preset Rapidi")
         for name, params in PRESETS_FACTORY.items():
             if st.button(name, use_container_width=True):
-                for k, v in params.items(): st.session_state[k] = v
+                for k, v in params.items():
+                    st.session_state[k] = v
                 st.rerun()
 
         st.markdown("---")
-        st.header("💾 Salva il tuo Preset")
-        preset_name = st.text_input("Nome Preset", "Mio Preset")
+        st.header("💾 Salva/Carica")
         
-        # Raccolgo i dati attuali
-        current_config = {
-            "drone_vol": st.session_state.drone_vol,
-            "v_mix": st.session_state.v_mix,
-            "auto_m": st.session_state.auto_m,
-            "grit": st.session_state.grit,
-            "g_size": st.session_state.g_size,
-            "rnd_f": st.session_state.rnd_f,
-            "chaos": st.session_state.chaos,
-            "intensity": st.session_state.intensity,
-            "seed": st.session_state.seed
-        }
-        
+        # Download Preset
+        current_config = {k: st.session_state[k] for k in defaults.keys()}
         preset_json = json.dumps(current_config, indent=4)
-        st.download_button(
-            label="📥 Scarica Preset JSON",
-            data=preset_json,
-            file_name=f"{preset_name.lower().replace(' ', '_')}.json",
-            mime="application/json",
-            use_container_width=True
-        )
+        st.download_button("📥 Scarica JSON", preset_json, "preset.json", "application/json", use_container_width=True)
 
-        st.markdown("---")
-        st.header("📤 Carica Preset Esterno")
-        uploaded_preset = st.file_uploader("Carica .json", type="json")
+        # Upload Preset
+        uploaded_preset = st.file_uploader("📤 Carica .json", type="json")
         if uploaded_preset:
-            if st.button("Applica Preset Caricato"):
+            if st.button("Applica Caricato"):
                 data = json.load(uploaded_preset)
                 for k, v in data.items(): st.session_state[k] = v
                 st.rerun()
@@ -160,22 +143,23 @@ def main():
     st.subheader("🎛️ Pannello di Controllo")
     col1, col2, col3 = st.columns(3)
 
+    # Nota: Usiamo direttamente st.session_state[key] come valore iniziale
     with col1:
-        st.session_state.drone_vol = st.slider("Volume Drone", 0.0, 1.0, key="drone_vol", value=st.session_state.drone_vol)
-        st.session_state.v_mix = st.slider("Mix Audio Video", 0.0, 1.0, key="v_mix", value=st.session_state.v_mix)
-        st.session_state.auto_m = st.slider("Auto-Morphing", 0.0, 1.0, key="auto_m", value=st.session_state.auto_m)
+        st.slider("Volume Drone", 0.0, 1.0, key="drone_vol")
+        st.slider("Mix Audio Video", 0.0, 1.0, key="v_mix")
+        st.slider("Auto-Morphing", 0.0, 1.0, key="auto_m")
 
     with col2:
-        st.session_state.grit = st.slider("Grit (Bitcrush)", 0.0, 1.0, key="grit", value=st.session_state.grit)
-        st.session_state.g_size = st.slider("Dimensione Grano", 0.05, 1.5, key="g_size", value=st.session_state.g_size)
-        st.session_state.rnd_f = st.slider("Random Factor", 0.0, 1.0, key="rnd_f", value=st.session_state.rnd_f)
+        st.slider("Grit (Bitcrush)", 0.0, 1.0, key="grit")
+        st.slider("Dimensione Grano", 0.05, 1.5, key="g_size")
+        st.slider("Random Factor", 0.0, 1.0, key="rnd_f")
 
     with col3:
-        st.session_state.chaos = st.slider("Chaos Factor", 0.0, 1.0, key="chaos", value=st.session_state.chaos)
-        st.session_state.intensity = st.slider("Intensità Totale", 0.0, 1.0, key="intensity", value=st.session_state.intensity)
-        st.session_state.seed = st.number_input("Seed", key="seed", value=int(st.session_state.seed))
+        st.slider("Chaos Factor", 0.0, 1.0, key="chaos")
+        st.slider("Intensità Totale", 0.0, 1.0, key="intensity")
+        st.number_input("Seed", key="seed")
 
-    # LOGICA GENERAZIONE (stessa di prima)
+    # LOGICA GENERAZIONE
     if video_file:
         tfile = tempfile.NamedTemporaryFile(delete=False)
         tfile.write(video_file.read())
@@ -183,8 +167,8 @@ def main():
         if st.button("🚀 GENERA SOUND DESIGN", use_container_width=True):
             try:
                 with st.spinner("Analisi e Generazione..."):
-                    # Detect cuts semplificato per velocità
                     clip = VideoFileClip(tfile.name)
+                    # Detect tagli (semplificato)
                     fps = min(clip.fps, 8)
                     times = np.arange(0, clip.duration, 1.0 / fps)
                     cuts = [0.0]
