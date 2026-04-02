@@ -129,7 +129,12 @@ def generate_glitch_audio(video_path, energy, duration, params, sr=44100):
     G_LEN      = int(sr * params["g_size"])
     N_GRAINS   = int(duration / 0.005)
 
-    starts = np.random.randint(0, max(1, N - G_LEN), size=N_GRAINS)
+    # Posizioni temporali uniformi (ogni 5ms, come il loop originale)
+    # + piccola variazione casuale per evitare ripetizioni meccaniche
+    base_starts = np.linspace(0, N - G_LEN - 1, N_GRAINS, dtype=np.int64)
+    jitter      = np.random.randint(-G_LEN // 2, G_LEN // 2 + 1, size=N_GRAINS)
+    starts      = np.clip(base_starts + jitter, 0, N - G_LEN - 1).astype(np.int64)
+
     powers = e_map[starts] * intensity
     keep   = (powers > 0.02) | (np.random.random(N_GRAINS) < 0.05)
     starts, powers = starts[keep], powers[keep]
