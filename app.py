@@ -28,31 +28,74 @@ from moviepy.editor import VideoFileClip, AudioFileClip
 # ──────────────────────────────────────────────────────────────────────────────
 
 def analyze_video(video_path: str, res=(160, 120)) -> np.ndarray:
+    """
+    Energia per frame combinando 3 segnali:
+      A) Movimento (diff luminanza)        – come prima
+      B) Shift di colore (diff HSV hue)    – cambi di tinta, luci colorate
+      C) Taglio di scena (spike istogramma) – transizioni brusche
+    I tre canali vengono normalizzati e mixati con pesi diversi.
+    """
     cap = cv2.VideoCapture(video_path)
-    scores = []
-    prev = None
+    motion_s, color_s, hist_s = [], [], []
+    prev_gray = prev_hue = prev_hist = None
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, res)
-        if prev is not None:
-            diff = cv2.absdiff(gray, prev)
-            scores.append(float(np.mean(diff) + np.std(diff)))
+        small = cv2.resize(frame, res)
+
+        # A) Movimento (luminanza)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            motion_s.append(float(np.mean(diff) + np.std(diff)))
         else:
-            scores.append(0.0)
-        prev = gray
+            motion_s.append(0.0)
+        prev_gray = gray
+
+        # B) Shift di colore (canale Hue in HSV)
+        hsv  = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        hue  = hsv[:, :, 0].astype(np.float32)
+        if prev_hue is not None:
+            # differenza circolare su [0,180]
+            d = np.abs(hue - prev_hue)
+            d = np.minimum(d, 180 - d)
+            color_s.append(float(np.mean(d) + np.std(d)))
+        else:
+            color_s.append(0.0)
+        prev_hue = hue
+
+        # C) Taglio di scena (distanza istogramma BGR)
+        hist = cv2.calcHist([small], [0, 1, 2], None, [8, 8, 8],
+                            [0, 256, 0, 256, 0, 256]).flatten()
+        hist = hist / (hist.sum() + 1e-6)
+        if prev_hist is not None:
+            hist_s.append(float(np.sum(np.abs(hist - prev_hist))))
+        else:
+            hist_s.append(0.0)
+        prev_hist = hist
+
     cap.release()
 
-    arr = np.array(scores, dtype=np.float32)
-    mx = arr.max()
+    def norm(x):
+        a = np.array(x, dtype=np.float32)
+        mx = a.max()
+        return a / mx if mx > 0 else np.full_like(a, 0.1)
+
+    motion = norm(motion_s)
+    color  = norm(color_s)
+    scene  = norm(hist_s)
+
+    # Pesi: movimento 40%, colore 35%, taglio scena 25%
+    combined = 0.40 * motion + 0.35 * color + 0.25 * scene
+
+    # Normalizza finale + curva che enfatizza i picchi
+    mx = combined.max()
     if mx > 0:
-        arr = arr / mx
-        arr = np.power(arr, 1.5)
-    else:
-        arr = np.full_like(arr, 0.1)
-    return arr
+        combined = combined / mx
+    combined = np.power(combined, 1.3)   # meno aggressivo di 1.5 perché già ricco
+    return combined
 
 
 # ──────────────────────────────────────────────────────────────────────────────
