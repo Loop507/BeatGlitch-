@@ -1,26 +1,19 @@
-# BeatGlitch – Cloud Optimized Version (Streamlit Community Cloud)
-# Focus: low RAM, chunk processing, preview mode, caching
+# BeatGlitch – MP3/WAV Toggle (Streamlit Cloud Ready)
 
-import os, tempfile, json, time
+import os, tempfile
 import numpy as np
 import cv2
 import librosa
 import soundfile as sf
 import streamlit as st
 from moviepy.editor import VideoFileClip, AudioFileClip
+from pydub import AudioSegment
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
 MAX_DURATION = 30
 PREVIEW_SR = 22050
 FINAL_SR = 44100
 FRAME_ANALYSIS_FPS = 10
 CHUNK_SEC = 5
-
-# ─────────────────────────────────────────────
-# VIDEO ANALYSIS (CACHED + DOWNSAMPLED)
-# ─────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def analyze_video(video_path):
@@ -30,8 +23,8 @@ def analyze_video(video_path):
 
     energy = []
     prev_gray = None
-
     i = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -52,9 +45,7 @@ def analyze_video(video_path):
         else:
             motion = 0
 
-        val = (0.6 * motion + 0.4 * lum)
-        energy.append(val)
-
+        energy.append(0.6 * motion + 0.4 * lum)
         prev_gray = gray
         i += 1
 
@@ -64,11 +55,8 @@ def analyze_video(video_path):
     if energy.max() > 0:
         energy /= energy.max()
 
-    return energy, fps
+    return energy
 
-# ─────────────────────────────────────────────
-# AUDIO ENGINE (CHUNKED)
-# ─────────────────────────────────────────────
 
 def limiter(x):
     return np.tanh(x)
@@ -78,7 +66,6 @@ def generate_audio(video_path, energy, duration, sr, params):
     N = int(duration * sr)
     chunk_size = int(CHUNK_SEC * sr)
 
-    # Load source
     try:
         src, _ = librosa.load(video_path, sr=sr, mono=False)
         if src.ndim == 1:
@@ -102,27 +89,22 @@ def generate_audio(video_path, energy, duration, sr, params):
     for i in range(0, N, chunk_size):
         end = min(i + chunk_size, N)
         chunk_len = end - i
-
         e = e_map[i:end]
-        noise = np.random.randn(2, chunk_len).astype(np.float32)
 
+        noise = np.random.randn(2, chunk_len).astype(np.float32)
         out[:, i:end] += noise * e * params["intensity"]
 
     drone = np.sin(2*np.pi*55*np.linspace(0,duration,N)) * params["drone"]
     out += np.tile(drone, (2,1))
 
     mix = src * params["orig"] + out * params["mix"]
-
     return limiter(mix)
 
-# ─────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────
 
-st.set_page_config(layout="wide")
-st.title("BeatGlitch – Cloud Edition")
+st.title("BeatGlitch – MP3/WAV Edition")
 
 mode = st.radio("Mode", ["Preview", "Final"])
+format_choice = st.radio("Audio Format", ["WAV", "MP3"])
 
 file = st.file_uploader("Upload video", type=["mp4","mov"])
 
@@ -135,11 +117,10 @@ if file:
     duration = clip.duration
 
     if duration > MAX_DURATION:
-        st.error("Max 30s allowed on cloud")
+        st.error("Max 30s allowed")
         st.stop()
 
-    energy, fps = analyze_video(path)
-
+    energy = analyze_video(path)
     st.line_chart(energy)
 
     params = {
@@ -154,21 +135,38 @@ if file:
 
         audio = generate_audio(path, energy, duration, sr, params)
 
-        st.audio(audio.T, sample_rate=sr)
+        audio = np.clip(audio, -1.0, 1.0)
+        audio_int16 = (audio * 32767).astype(np.int16)
 
-        if mode == "Final":
-            wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            sf.write(wav.name, audio.T, sr)
+        if format_choice == "WAV":
+            out_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            sf.write(out_audio.name, audio.T, sr)
+            st.audio(out_audio.name)
 
-            out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-
-            clip.set_audio(AudioFileClip(wav.name)).write_videofile(
-                out, codec="libx264", preset="ultrafast", audio_codec="aac", logger=None
+        else:
+            audio_segment = AudioSegment(
+                audio_int16.T.tobytes(),
+                frame_rate=sr,
+                sample_width=2,
+                channels=2
             )
 
-            st.video(out)
+            out_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            audio_segment.export(out_audio.name, format="mp3", bitrate="192k")
+            st.audio(out_audio.name)
 
-            with open(out, "rb") as f:
-                st.download_button("Download", f, "glitch.mp4")
+        if mode == "Final":
+            out_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-            os.unlink(wav.name)
+            clip.set_audio(AudioFileClip(out_audio.name)).write_videofile(
+                out_video,
+                codec="libx264",
+                preset="ultrafast",
+                audio_codec="aac",
+                logger=None
+            )
+
+            st.video(out_video)
+
+            with open(out_video, "rb") as f:
+                st.download_button("Download video", f, "glitch.mp4")
