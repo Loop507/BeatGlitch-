@@ -6,7 +6,7 @@ import soundfile as sf
 import streamlit as st
 from moviepy.editor import VideoFileClip, AudioFileClip
 
-# 1. ANALISI VIDEO
+# 1. ANALISI SENSORI VIDEO
 def analyze_video_v10(video_path):
     cap = cv2.VideoCapture(video_path)
     sig = {"lum": [], "mot": [], "hue": [], "var": []}
@@ -34,7 +34,7 @@ def analyze_video_v10(video_path):
 
 # 2. MOTORE DI DISTRUZIONE
 def generate_v10_engine(video_path, audio_ext_path, sig, duration, p, sr=44100):
-    np.random.seed(p["seed"])
+    np.random.seed(int(p["seed"])) # Il Seed blocca la casualità della tempesta
     N = int(duration * sr)
     t_ax = np.linspace(0, duration, N)
     mot = np.interp(t_ax, np.linspace(0, duration, len(sig["mot"])), sig["mot"])
@@ -75,58 +75,77 @@ def generate_v10_engine(video_path, audio_ext_path, sig, duration, p, sr=44100):
     return np.tile(np.clip(final, -1.0, 1.0), (2, 1))
 
 # 3. INTERFACCIA
-st.set_page_config(page_title="BeatGlitch V10", layout="wide")
-st.title("🌪️ BeatGlitch V10: Audio-Shredder")
+st.set_page_config(page_title="BeatGlitch V10 Pro", layout="wide")
+st.title("🌪️ BeatGlitch V10 Pro: Preset Manager")
 
-presets = {
-    "Default (Bilanciato)": {"v_orig": 0.3, "v_mix": 2.5, "stut_ms": 45, "stut_rep": 12, "int": 1.5, "grit": 0.6},
-    "Disco Rotto (Locked Groove)": {"v_orig": 0.1, "v_mix": 3.5, "stut_ms": 80, "stut_rep": 25, "int": 2.0, "grit": 0.4},
-    "Cyber-Noise (Total)": {"v_orig": 0.0, "v_mix": 4.5, "stut_ms": 15, "stut_rep": 8, "int": 3.5, "grit": 0.95},
-    "Ghost (Sussurri)": {"v_orig": 0.05, "v_mix": 1.5, "stut_ms": 120, "stut_rep": 4, "int": 1.0, "grit": 0.2},
-    "Radio Interferenza": {"v_orig": 0.2, "v_mix": 3.0, "stut_ms": 5, "stut_rep": 40, "int": 2.5, "grit": 0.98},
-    "Glitch-Hop Beats": {"v_orig": 0.4, "v_mix": 3.0, "stut_ms": 30, "stut_rep": 16, "int": 2.2, "grit": 0.5},
-    "Deep Drone": {"v_orig": 0.1, "v_mix": 2.0, "stut_ms": 200, "stut_rep": 2, "int": 1.2, "grit": 0.8},
-    "Vinyl Scratch": {"v_orig": 0.15, "v_mix": 4.0, "stut_ms": 10, "stut_rep": 30, "int": 3.0, "grit": 0.7}
+# Default Presets
+presets_lib = {
+    "Default (Bilanciato)": {"v_orig": 0.3, "v_mix": 2.5, "stut_ms": 45, "stut_rep": 12, "int": 1.5, "grit": 0.6, "seed": 42},
+    "Disco Rotto": {"v_orig": 0.1, "v_mix": 3.5, "stut_ms": 80, "stut_rep": 25, "int": 2.0, "grit": 0.4, "seed": 77},
+    "Cyber-Noise": {"v_orig": 0.0, "v_mix": 4.5, "stut_ms": 15, "stut_rep": 8, "int": 3.5, "grit": 0.95, "seed": 666}
 }
 
 with st.sidebar:
-    v_file = st.file_uploader("1. Carica Video", type=["mp4", "mov"])
-    a_file = st.file_uploader("2. Audio Esterno (Opzionale)", type=["mp3", "wav"])
+    st.header("📂 File & Preset")
+    v_file = st.file_uploader("Video", type=["mp4", "mov"])
+    a_file = st.file_uploader("Audio Esterno", type=["mp3", "wav"])
+    
     st.markdown("---")
-    selected_preset = st.selectbox("🎯 SCEGLI UNO STILE", list(presets.keys()))
-    ps = presets[selected_preset]
+    # Caricamento Preset Esterno
+    preset_upload = st.file_uploader("Carica Preset JSON", type="json")
+    
+    # Logica di caricamento valori
+    if preset_upload:
+        config = json.load(preset_upload)
+    else:
+        sel = st.selectbox("🎯 Preset Rapidi", list(presets_lib.keys()))
+        config = presets_lib[sel]
 
-st.subheader(f"🎛️ Configurazione Attiva: {selected_preset}")
+st.subheader("🎛️ Pannello di Controllo")
 c1, c2, c3 = st.columns(3)
 with c1:
-    v_orig_vol = st.slider("Volume Originale", 0.0, 1.0, ps["v_orig"])
-    v_mix = st.slider("Potenza Glitch", 0.0, 5.0, ps["v_mix"])
+    v_orig_vol = st.slider("Volume Originale", 0.0, 1.0, config.get("v_orig", 0.3))
+    v_mix = st.slider("Potenza Glitch", 0.0, 5.0, config.get("v_mix", 2.5))
+    seed_val = st.number_input("🎲 Seed (Identità)", value=config.get("seed", 42))
+
 with c2:
-    stutter_ms = st.slider("Durata Loop (ms)", 5, 250, ps["stut_ms"])
-    stutter_reps = st.slider("Ripetizioni Loop", 1, 60, ps["stut_rep"])
+    stutter_ms = st.slider("Loop ms", 5, 250, config.get("stut_ms", 45))
+    stutter_reps = st.slider("Ripetizioni", 1, 60, config.get("stut_rep", 12))
+
 with c3:
-    intensity = st.slider("Sensibilità Pixel", 0.1, 4.0, ps["int"])
-    grit = st.slider("Grit (Sporcizia)", 0.0, 1.0, ps["grit"])
+    intensity = st.slider("Sensibilità", 0.1, 4.0, config.get("int", 1.5))
+    grit = st.slider("Grit", 0.0, 1.0, config.get("grit", 0.6))
+
+# Tasto per scaricare il Preset attuale
+current_params = {
+    "v_orig": v_orig_vol, "v_mix": v_mix, "stut_ms": stutter_ms, 
+    "stut_rep": stutter_reps, "int": intensity, "grit": grit, "seed": seed_val
+}
+st.sidebar.download_button(
+    label="💾 Salva Preset Attuale",
+    data=json.dumps(current_params),
+    file_name="mio_preset_glitch.json",
+    mime="application/json"
+)
 
 if v_file:
-    if st.button("🚀 GENERA REMIX"):
-        with st.status("Distruggendo gli atomi sonori...") as s:
+    if st.button("🚀 GENERA", use_container_width=True):
+        with st.status("Elaborazione...") as s:
             t_v = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             t_v.write(v_file.read())
-            t_a = None
+            t_a_ext = None
             if a_file:
-                t_a = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                t_a.write(a_file.read())
+                t_a_ext = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                t_a_ext.write(a_file.read())
             
             sig = analyze_video_v10(t_v.name)
             clip = VideoFileClip(t_v.name)
-            params = {"v_orig_vol":v_orig_vol, "v_mix":v_mix, "intensity":intensity, "stutter_ms":stutter_ms, "stutter_reps":stutter_reps, "grit":grit, "seed":42}
             
-            audio = generate_v10_engine(t_v.name, t_a.name if t_a else None, sig, clip.duration, params)
+            audio = generate_v10_engine(t_v.name, t_a_ext.name if t_a_ext else None, sig, clip.duration, current_params)
             t_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             sf.write(t_wav.name, audio.T, 44100)
             
             out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
             clip.set_audio(AudioFileClip(t_wav.name)).write_videofile(out, codec="libx264", audio_codec="aac", logger=None)
             st.video(out)
-            s.update(label="Remix Pronto!", state="complete")
+            s.update(label="Completato!", state="complete")
