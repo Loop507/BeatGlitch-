@@ -21,45 +21,66 @@ from moviepy.editor import VideoFileClip, AudioFileClip
 # ─────────────────────────────────────────────────────────────────
 
 def analyze_video(video_path, res=(160, 120)):
+    """
+    Estrae 5 segnali indipendenti per frame (come VideoSound Gen.):
+      lum   – luminosità media normalizzata
+      detail – deviazione standard pixel (quanto è "ricco" il frame)
+      motion – differenza assoluta media tra frame consecutivi
+      var_motion – variazione del movimento (delta tra motion corrente e precedente)
+      hue_shift  – shift di colore (Hue circolare, scene colorate)
+    Più: scene_cuts (spike istogramma) e fps.
+    """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    motion_s, color_s, hist_s = [], [], []
+
+    lum_s, det_s, mot_s, var_s, hue_s, hist_s = [], [], [], [], [], []
     prev_gray = prev_hue = prev_hist = None
+    prev_motion = 0.0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         small = cv2.resize(frame, res)
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-        # A) Movimento luminanza
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        # Luminosità
+        lum_s.append(float(np.mean(gray)) / 255.0)
+
+        # Dettaglio
+        det_s.append(float(np.std(gray)) / 255.0)
+
+        # Movimento
         if prev_gray is not None:
             diff = cv2.absdiff(gray, prev_gray)
-            motion_s.append(float(np.mean(diff) + np.std(diff)))
+            mot  = float(np.mean(diff)) / 255.0
         else:
-            motion_s.append(0.0)
-        prev_gray = gray
+            mot = 0.0
+        mot_s.append(mot)
 
-        # B) Shift colore (Hue circolare)
+        # Variazione del movimento
+        var_s.append(abs(mot - prev_motion))
+        prev_motion = mot
+        prev_gray   = gray
+
+        # Shift colore Hue
         hue = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[:, :, 0].astype(np.float32)
         if prev_hue is not None:
             d = np.abs(hue - prev_hue)
             d = np.minimum(d, 180 - d)
-            color_s.append(float(np.mean(d) + np.std(d)))
+            hue_s.append(float(np.mean(d) + np.std(d)))
         else:
-            color_s.append(0.0)
+            hue_s.append(0.0)
         prev_hue = hue
 
-        # C) Distanza istogramma (scene cut)
-        hist = cv2.calcHist([small], [0,1,2], None, [8,8,8],
-                            [0,256,0,256,0,256]).flatten()
-        hist /= hist.sum() + 1e-6
+        # Istogramma per scene cut
+        h = cv2.calcHist([small],[0,1,2],None,[8,8,8],[0,256,0,256,0,256]).flatten()
+        h /= h.sum() + 1e-6
         if prev_hist is not None:
-            hist_s.append(float(np.sum(np.abs(hist - prev_hist))))
+            hist_s.append(float(np.sum(np.abs(h - prev_hist))))
         else:
             hist_s.append(0.0)
-        prev_hist = hist
+        prev_hist = h
 
     cap.release()
 
@@ -68,18 +89,32 @@ def analyze_video(video_path, res=(160, 120)):
         mx = a.max()
         return a / mx if mx > 0 else np.full_like(a, 0.1)
 
-    energy = 0.40 * norm(motion_s) + 0.35 * norm(color_s) + 0.25 * norm(hist_s)
+    sig = {
+        "lum":       norm(lum_s),
+        "detail":    norm(det_s),
+        "motion":    norm(mot_s),
+        "var_motion":norm(var_s),
+        "hue":       norm(hue_s),
+        "scene":     norm(hist_s),
+    }
+
+    # energy composita per compatibilità con il resto del codice
+    energy = (0.30 * sig["motion"]
+            + 0.25 * sig["var_motion"]
+            + 0.20 * sig["hue"]
+            + 0.15 * sig["detail"]
+            + 0.10 * sig["scene"])
     mx = energy.max()
     if mx > 0:
         energy /= mx
-    energy = np.power(energy, 1.3)
+    energy = np.power(energy, 1.2)
+    sig["energy"] = energy
 
-    # Scene cuts: frame dove l'istogramma salta sopra soglia adattiva
-    scene_arr = norm(hist_s)
-    threshold = float(np.percentile(scene_arr, 90))
-    scene_cuts = np.where(scene_arr > threshold)[0]
+    # Scene cuts: picchi top-10% dell'istogramma
+    thr = float(np.percentile(sig["scene"], 90))
+    scene_cuts = np.where(sig["scene"] > thr)[0]
 
-    return energy, scene_cuts, fps
+    return sig, scene_cuts, fps
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -295,7 +330,8 @@ if v_file:
         try:
             prog = st.progress(0, text="[1/4] Analisi video...")
             t0 = time.time()
-            energy, scene_cuts, fps = analyze_video(vpath)
+            sig, scene_cuts, fps = analyze_video(vpath)
+            energy = sig["energy"]
             st.caption(f"✓ Frames: {len(energy)}, Scene cuts: {len(scene_cuts)}  ({time.time()-t0:.1f}s)")
 
             prog.progress(25, text="[2/4] Apertura clip...")
@@ -305,7 +341,7 @@ if v_file:
 
             prog.progress(40, text="[3/4] Sintesi glitch (micro-reazione + stutter)...")
             t0    = time.time()
-            audio = generate_glitch_audio(vpath, energy, scene_cuts, fps, duration, params)
+            audio = generate_glitch_audio(vpath, sig, scene_cuts, fps, duration, params)
             st.caption(f"✓ Audio sintetizzato  ({time.time()-t0:.1f}s)")
 
             prog.progress(75, text="[4/4] Export video...")
