@@ -10,6 +10,12 @@ import cv2
 SR = 44100
 FPS = 30
 
+# Questo modulo (01) è dedicato al riferimento Ikeda — la suite prevede altri moduli
+# (02/03/04) dedicati agli altri riferimenti concettuali della serie BeatGlitch.
+MODULE_ID = "01"
+MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {MODULE_ID}"
+MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{MODULE_ID}"
+
 SOURCE_COLOR = {
     "ca":    (235, 235, 235),   # procedurale — bianco/grigio
     "midi":  (255, 180, 0),     # ambra/oro
@@ -281,12 +287,14 @@ def build_score(duration, seed, rule=30,
 
     macro = generate_macro_envelope_procedural(duration, effective_seed, resolution)
     external_envs = [e for e in (audio_env, video_env) if e is not None and len(e) > 1]
+    silence_envelope = None  # se presente, pilota il "gate silenzio" nel rendering
     if external_envs:
         resampled = [
             np.interp(np.linspace(0, 1, resolution), np.linspace(0, 1, len(e)), e)
             for e in external_envs
         ]
         combined_ext = np.mean(resampled, axis=0)
+        silence_envelope = combined_ext  # inviluppo reale, non mescolato col rumore procedurale
         macro = 0.4 * macro + 0.6 * combined_ext  # gli esterni pesano di più se presenti
 
     # quando ci sono fonti esterne, la texture procedurale fa da "base" più leggera,
@@ -308,6 +316,7 @@ def build_score(duration, seed, rule=30,
         "seed": effective_seed,
         "events": events,
         "macro_envelope": macro,
+        "silence_envelope": silence_envelope,
         "micro_texture": texture,
     }
 
@@ -355,6 +364,16 @@ def render_frame(t, score, width=960, height=540, orientation="verticale",
         for gy in range(0, height, grid_step):
             frame[gy, :] = (grid_alpha, grid_alpha, grid_alpha)
 
+    # gate silenzio: durante il silenzio reale (inviluppo audio/video esterno vicino
+    # a zero) non deve comparire nessuna striscia — uso l'inviluppo "puro", non la
+    # matrice mescolata col rumore procedurale, altrimenti il silenzio non è mai vero zero
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / max(score["duration"], 1e-6)) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame  # silenzio: solo la griglia di fondo, nessuna striscia
+
     active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
     num_lanes = max(1, int(num_lanes))
 
@@ -371,13 +390,14 @@ def render_frame(t, score, width=960, height=540, orientation="verticale",
         lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
         lane_idx = int(lane_frac * num_lanes)
 
-        extent_frac = (0.2 + 0.75 * e["vel"]) * (1 - prog * 0.3)  # lunghezza della barra
+        # barre più grandi di default: riempiono meglio la scena e calano più lentamente
+        extent_frac = (0.45 + 0.55 * e["vel"]) * (1 - prog * 0.15)
         event_orientation = _event_orientation(e, orientation)
 
         if event_orientation == "verticale":
             lane_w = width / num_lanes
             x_center = lane_idx * lane_w + lane_w / 2
-            bar_w = int(np.clip(lane_w * 0.55 * thickness_factor, 3, lane_w * 0.95))
+            bar_w = int(np.clip(lane_w * 0.75 * thickness_factor, 4, lane_w * 0.98))
             bar_len = int(height * extent_frac)
             y0 = height // 2 - bar_len // 2
             x0 = int(x_center - bar_w / 2)
@@ -385,7 +405,7 @@ def render_frame(t, score, width=960, height=540, orientation="verticale",
         else:  # orizzontale
             lane_h = height / num_lanes
             y_center = lane_idx * lane_h + lane_h / 2
-            bar_h = int(np.clip(lane_h * 0.55 * thickness_factor, 3, lane_h * 0.95))
+            bar_h = int(np.clip(lane_h * 0.75 * thickness_factor, 4, lane_h * 0.98))
             bar_len = int(width * extent_frac)
             x0 = width // 2 - bar_len // 2
             y0 = int(y_center - bar_h / 2)
@@ -485,8 +505,8 @@ def generate_text_report(params, score, brand="Loop507", vol=None):
     n_frames = int(round(score["duration"] * FPS))
 
     righe = []
-    righe.append(f"[BEATGLITCH_MATRICE] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
-    righe.append(":: MOTORE: matrice_engine [v1.0 — generativo condiviso]")
+    righe.append(f"[BEATGLITCH_MATRICE_ENGINE_{MODULE_ID}] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
+    righe.append(f":: MOTORE: matrice_engine_{MODULE_ID} [v1.0 — generativo condiviso]")
     righe.append(f":: EFFETTO: Cellular Drift — Regola {params['rule']}")
     righe.append(f":: ANALISI: {' / '.join(analisi)}")
     fonti_str = " + ".join(fonti_attive) if fonti_attive else "Nessuna (generazione pura)"
@@ -535,8 +555,8 @@ except ModuleNotFoundError:
     from moviepy import VideoClip, AudioFileClip  # moviepy 2.x
 import soundfile as sf
 
-st.set_page_config(page_title="BeatGlitch — Matrice Engine", layout="wide")
-st.title("◧ BEATGLITCH — MATRICE ENGINE")
+st.set_page_config(page_title=MODULE_TITLE, layout="wide")
+st.title(f"◧ {MODULE_TITLE}")
 st.caption("Generazione audio-video procedurale da una struttura dati condivisa. "
            "MIDI, audio e video sono opzionali: senza input, il sistema genera da sé.")
 
@@ -710,6 +730,8 @@ if st.button("🚀 GENERA", use_container_width=True):
                               fps=FPS, logger=None)
 
         st.write("Generazione report...")
+        ts_compact = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_filename = f"{MODULE_FILENAME_BASE}_{ts_compact}"
         report_params = {
             "seed": int(seed), "rule": rule, "duration": score["duration"],
             "resolution": f"{export_w}x{export_h}", "audio_mode": audio_mode,
@@ -724,6 +746,7 @@ if st.button("🚀 GENERA", use_container_width=True):
     st.session_state["result"] = {
         "video_path": out_path,
         "report_text": report_text,
+        "base_filename": base_filename,
         "preset_export": {
             "seed": int(seed), "rule": rule, "duration": score["duration"],
             "n_events": len(score["events"]),
@@ -753,12 +776,12 @@ if "result" in st.session_state:
 
     col_dl1, col_dl2 = st.columns(2)
     with open(res["video_path"], "rb") as f:
-        col_dl1.download_button("💾 Scarica video", f, file_name="beatglitch_output.mp4",
+        col_dl1.download_button("💾 Scarica video", f, file_name=f"{res['base_filename']}.mp4",
                                  use_container_width=True, key="dl_video")
     col_dl2.download_button("📄 Scarica report (txt)", res["report_text"],
-                             file_name="beatglitch_report.txt", mime="text/plain",
+                             file_name=f"{res['base_filename']}_report.txt", mime="text/plain",
                              use_container_width=True, key="dl_report")
 
     st.sidebar.download_button("💾 Esporta matrice (info)",
                                 json.dumps(res["preset_export"], indent=2),
-                                "beatglitch_score_info.json", key="dl_json")
+                                f"{res['base_filename']}_info.json", key="dl_json")
