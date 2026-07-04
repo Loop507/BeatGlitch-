@@ -261,3 +261,135 @@ def synthesize_audio(score, sr=SR):
 
     out = np.clip(out, -1.0, 1.0)
     return np.tile(out, (2, 1))
+
+
+import streamlit as st
+try:
+    from moviepy.editor import VideoClip, AudioFileClip  # moviepy 1.x
+except ModuleNotFoundError:
+    from moviepy import VideoClip, AudioFileClip  # moviepy 2.x
+import soundfile as sf
+
+st.set_page_config(page_title="Ikeda Engine — Loop507", layout="wide")
+st.title("◧ IKEDA ENGINE")
+st.caption("Generazione audio-video procedurale da una partitura condivisa. "
+           "MIDI, audio e video sono opzionali: senza input, il sistema genera da sé.")
+
+# ------------------------------------------------------------
+# SIDEBAR — sorgenti e parametri
+# ------------------------------------------------------------
+with st.sidebar:
+    st.header("📥 Input esterni (opzionali)")
+    midi_file = st.file_uploader("MIDI", type=["mid", "midi"])
+    audio_file = st.file_uploader("Audio", type=["mp3", "wav"])
+    video_file = st.file_uploader("Video", type=["mp4", "mov"])
+
+    st.markdown("---")
+    st.header("🎛️ Parametri generativi")
+    seed = st.number_input("🎲 Seed", value=42, step=1)
+    rule = st.selectbox("Regola automa cellulare", [30, 90, 110, 54, 60, 150],
+                         help="Regola di Wolfram: 30=caotica, 90=frattale, 110=complessa")
+    manual_duration = st.slider("Durata (se nessun input caricato)", 5, 60, 15)
+
+    st.markdown("---")
+    show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True)
+
+# ------------------------------------------------------------
+# ESTRAZIONE — ogni input presente alimenta un ruolo diverso
+# ------------------------------------------------------------
+midi_events, audio_events, audio_env, video_events, video_env = None, None, None, None, None
+durations = []
+
+def save_upload(f, suffix):
+    t = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    t.write(f.read())
+    t.close()
+    return t.name
+
+if midi_file:
+    with st.spinner("Estrazione eventi da MIDI..."):
+        midi_path = save_upload(midi_file, ".mid")
+        midi_events, midi_dur = extract_from_midi(midi_path)
+        durations.append(midi_dur)
+        st.sidebar.success(f"MIDI: {len(midi_events)} note estratte")
+
+if audio_file:
+    with st.spinner("Estrazione onset/energia da audio..."):
+        audio_path = save_upload(audio_file, os.path.splitext(audio_file.name)[1])
+        audio_events, audio_env, audio_dur = extract_from_audio(audio_path)
+        durations.append(audio_dur)
+        st.sidebar.success(f"Audio: {len(audio_events)} onset rilevati")
+
+if video_file:
+    with st.spinner("Analisi tagli di scena/motion da video..."):
+        video_path = save_upload(video_file, ".mp4")
+        video_events, video_env, video_dur = extract_from_video(video_path)
+        durations.append(video_dur)
+        st.sidebar.success(f"Video: {len(video_events)} tagli di scena rilevati")
+
+duration = max(durations) if durations else float(manual_duration)
+
+st.write(f"**Durata risultante:** {duration:.1f}s "
+         f"({'da input caricati' if durations else 'da slider, nessun input caricato'})")
+
+if show_source_legend:
+    legend_cols = st.columns(4)
+    labels = {"ca": "Procedurale (automa cellulare)", "midi": "MIDI",
+              "audio": "Audio", "video": "Video"}
+    for col, (key, label) in zip(legend_cols, labels.items()):
+        r, g, b = SOURCE_COLOR[key]
+        col.markdown(
+            f"<div style='display:flex;align-items:center;gap:8px'>"
+            f"<div style='width:14px;height:14px;background:rgb({r},{g},{b});border-radius:2px'></div>"
+            f"<span style='font-size:0.85em'>{label}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+# ------------------------------------------------------------
+# GENERAZIONE
+# ------------------------------------------------------------
+if st.button("🚀 GENERA", use_container_width=True):
+    with st.status("Costruzione partitura e rendering...", expanded=True) as status:
+        st.write("Combinazione delle fonti in un'unica partitura...")
+        score = build_score(
+            duration=duration, seed=int(seed), rule=rule,
+            midi_events=midi_events,
+            audio_events=audio_events, audio_env=audio_env,
+            video_events=video_events, video_env=video_env,
+        )
+        st.write(f"Partitura pronta — {len(score['events'])} eventi totali.")
+
+        st.write("Sintesi audio...")
+        audio_data = synthesize_audio(score, sr=SR)
+        t_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(t_wav.name, audio_data.T, SR)
+        t_wav.close()
+
+        st.write("Rendering fotogrammi (può richiedere qualche minuto)...")
+
+        def make_frame(t):
+            return render_frame(t, score)
+
+        clip = VideoClip(make_frame, duration=score["duration"])
+        clip = clip.with_fps(FPS) if hasattr(clip, "with_fps") else clip.set_fps(FPS)
+        audio_clip = AudioFileClip(t_wav.name)
+        clip = clip.with_audio(audio_clip) if hasattr(clip, "with_audio") else clip.set_audio(audio_clip)
+
+        out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+        clip.write_videofile(out_path, codec="libx264", audio_codec="aac",
+                              fps=FPS, logger=None)
+
+        status.update(label="Fatto!", state="complete")
+
+    st.video(out_path)
+    with open(out_path, "rb") as f:
+        st.download_button("💾 Scarica video", f, file_name="ikeda_output.mp4")
+
+    preset_export = {
+        "seed": int(seed), "rule": rule, "duration": score["duration"],
+        "n_events": len(score["events"]),
+        "sources_used": sorted(set(e["source"] for e in score["events"])),
+    }
+    st.sidebar.download_button("💾 Esporta partitura (info)",
+                                json.dumps(preset_export, indent=2),
+                                "ikeda_score_info.json")
