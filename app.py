@@ -1,6 +1,6 @@
 """
-PARTITURA — motore generativo audio/video procedurale (Loop507)
-Genera una struttura dati astratta (la "partitura", procedurale e/o alimentata
+MATRICE — motore generativo audio/video procedurale (Loop507)
+Genera una struttura dati astratta (la "matrice", procedurale e/o alimentata
 da MIDI/audio/video esterni) e la trasforma sia in geometria visiva sia in
 sintesi sonora, dallo stesso dato condiviso.
 """
@@ -124,6 +124,26 @@ def extract_from_midi(midi_path):
     return events, duration
 
 
+BAND_PARAMS = {
+    "bass":   {"dur": 0.35, "thickness": 1.9, "pitch": 40},
+    "mid":    {"dur": 0.15, "thickness": 1.0, "pitch": 62},
+    "treble": {"dur": 0.05, "thickness": 0.55, "pitch": 84},
+}
+
+
+def _dominant_band(y_window, sr):
+    """Determina quale banda (bassi/medi/alti) domina in una finestra audio."""
+    if len(y_window) < 8:
+        return "mid"
+    spectrum = np.abs(np.fft.rfft(y_window))
+    freqs = np.fft.rfftfreq(len(y_window), 1.0 / sr)
+    bass = spectrum[(freqs >= 20) & (freqs < 250)].sum()
+    mid = spectrum[(freqs >= 250) & (freqs < 2000)].sum()
+    treble = spectrum[(freqs >= 2000) & (freqs < 8000)].sum()
+    energies = {"bass": bass, "mid": mid, "treble": treble}
+    return max(energies, key=energies.get)
+
+
 def extract_from_audio(audio_path):
     import librosa
     y, sr = librosa.load(audio_path, sr=SR, mono=True)
@@ -133,11 +153,21 @@ def extract_from_audio(audio_path):
     rms = librosa.feature.rms(y=y)[0]
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
 
+    win = 2048
     events = []
     for ot in onset_times:
         idx = int(np.argmin(np.abs(rms_times - ot)))
         vel = float(min(1.0, rms[idx] / (rms.max() + 1e-9)))
-        events.append({"t": float(ot), "dur": 0.15, "pitch": 60, "vel": vel, "source": "audio"})
+
+        sample_pos = int(ot * sr)
+        window = y[max(0, sample_pos - win // 2): sample_pos + win // 2]
+        band = _dominant_band(window, sr)
+        bp = BAND_PARAMS[band]
+
+        events.append({
+            "t": float(ot), "dur": bp["dur"], "pitch": bp["pitch"] + int(vel * 8),
+            "vel": vel, "source": "audio", "band": band,
+        })
 
     env = rms / (rms.max() + 1e-9)
     return events, env, duration, y
@@ -171,7 +201,7 @@ def extract_from_video(video_path):
 
 
 # ============================================================
-# 3. COMBINAZIONE — costruzione della partitura condivisa
+# 3. COMBINAZIONE — costruzione della matrice condivisa
 # ============================================================
 
 def _content_seed_offset(audio_env, video_env, midi_events):
@@ -255,8 +285,11 @@ def render_frame(t, score, width=960, height=540):
         prog = (t - e["t"]) / max(e["dur"], 0.05)
         h = int(height * (0.15 + 0.8 * e["vel"]) * (1 - prog * 0.3))
         color = SOURCE_COLOR.get(e["source"], (255, 255, 255))
-        prominence = 1.0 if e["source"] == "ca" else 1.6  # le fonti esterne risaltano di più
-        bar_w = max(2, int(6 * (0.5 + macro_v) * prominence))
+        if "band" in e:
+            thickness = BAND_PARAMS[e["band"]]["thickness"]
+        else:
+            thickness = 1.0 if e["source"] == "ca" else 1.6
+        bar_w = max(2, int(6 * (0.5 + macro_v) * thickness))
         y0 = height // 2 - h // 2
         cv2.rectangle(frame, (x, y0), (x + bar_w, y0 + max(h, 2)), color, -1)
 
@@ -310,47 +343,74 @@ def fit_audio_length(y, N):
     return np.tile(y, int(np.ceil(N / len(y))))[:N]
 
 
-def generate_text_report(params, score, brand="Loop507"):
-    """Report tecnico in stile Loop507 (':: ' prefix, testo semplice) — nessuna dipendenza extra."""
+def generate_text_report(params, score, brand="Loop507", vol=None):
+    """Report nel formato standard Loop507 (:: MOTORE / EFFETTO / TECHNICAL LOG SHEET)."""
     counts = {}
     for e in score["events"]:
         counts[e["source"]] = counts.get(e["source"], 0) + 1
 
-    labels = {"ca": "Procedurale (automa cellulare)", "midi": "MIDI",
-              "audio": "Audio", "video": "Video"}
+    band_counts = {}
+    for e in score["events"]:
+        if "band" in e:
+            band_counts[e["band"]] = band_counts.get(e["band"], 0) + 1
+
+    labels = {"ca": "Procedurale", "midi": "MIDI", "audio": "Audio", "video": "Video"}
+    fonti_attive = [labels[k] for k in ("midi", "audio", "video") if counts.get(k, 0) > 0]
+
+    analisi = ["Automa Cellulare", "Rumore Multi-Ottava"]
+    if counts.get("audio", 0) > 0:
+        analisi += ["Onset Detection", "Band Split (bassi/medi/alti)", "RMS Envelope"]
+    if counts.get("video", 0) > 0:
+        analisi.append("Scene Cut Detection")
+    if counts.get("midi", 0) > 0:
+        analisi.append("MIDI Parsing")
+
+    vol_num = vol if vol is not None else abs(score["seed"]) % 99
+    n_frames = int(round(score["duration"] * FPS))
 
     righe = []
-    righe.append(f":: PARTITURA — {brand}")
-    righe.append(f"Report tecnico generato il {params['timestamp']}")
-    righe.append("-" * 60)
+    righe.append(f"[BEATGLITCH_MATRICE] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
+    righe.append(":: MOTORE: matrice_engine [v1.0 — generativo condiviso]")
+    righe.append(f":: EFFETTO: Cellular Drift — Regola {params['rule']}")
+    righe.append(f":: ANALISI: {' / '.join(analisi)}")
+    fonti_str = " + ".join(fonti_attive) if fonti_attive else "Nessuna (generazione pura)"
+    righe.append(f":: PROCESSO: Matrice Condivisa — Fonti: {fonti_str}")
     righe.append("")
-    righe.append(":: PARAMETRI GENERATIVI")
-    righe.append(f"Seed (utente):     {params['seed']}")
-    righe.append(f"Seed effettivo:    {score['seed']}  (perturbato dal contenuto delle fonti esterne)")
-    righe.append(f"Regola automa:     {params['rule']}")
-    righe.append(f"Durata:            {params['duration']:.1f}s")
-    righe.append(f"Risoluzione:       {params['resolution']}")
-    righe.append(f"Colonna sonora:    {params['audio_mode']}")
-    righe.append(f"Eventi totali:     {len(score['events'])}")
+    righe.append('"Un unico dato ha generato insieme cio\' che si vede e cio\' che si sente."')
     righe.append("")
-    righe.append(":: FONTI DEGLI EVENTI")
-    for key, label in labels.items():
-        righe.append(f"  {label}: {counts.get(key, 0)} eventi")
+    righe.append("> TECHNICAL LOG SHEET:")
+    righe.append(f"* File: matrice_output_{params['timestamp'].replace('/', '').replace(':', '').replace(' ', '_')}")
+    righe.append(f"* Seed (utente): {params['seed']}")
+    righe.append(f"* Seed effettivo: {score['seed']} (perturbato dal contenuto delle fonti esterne)")
+    righe.append(f"* Rendering: {n_frames} frame @ {FPS}fps")
+    righe.append(f"* Risoluzione: {params['resolution']}")
+    righe.append(f"* Durata: {score['duration']:.1f}s")
+    righe.append(f"* Colonna sonora: {params['audio_mode']}")
+    righe.append(f"* Eventi totali: {len(score['events'])}")
+    righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
+    if counts.get("midi", 0) > 0:
+        righe.append(f"* Eventi MIDI: {counts.get('midi', 0)}")
+    if counts.get("audio", 0) > 0:
+        righe.append(f"* Eventi Audio: {counts.get('audio', 0)}")
+        righe.append(f"* Bilanciamento Frequenze: bassi {band_counts.get('bass', 0)} | "
+                      f"medi {band_counts.get('mid', 0)} | alti {band_counts.get('treble', 0)}")
+    if counts.get("video", 0) > 0:
+        righe.append(f"* Eventi Video (tagli scena): {counts.get('video', 0)}")
     righe.append("")
-    righe.append("-" * 60)
-    righe.append(":: CONCETTO")
-    righe.append("Un'unica struttura dati astratta (la partitura) genera contemporaneamente")
-    righe.append("la parte visiva e quella sonora dell'opera. Le fonti esterne opzionali")
-    righe.append("(MIDI, audio, video) alimentano ruoli specifici della partitura e ne")
-    righe.append("perturbano anche il motore procedurale di base, cosi' che fonti diverse")
-    righe.append("producano davvero pattern diversi, non solo pochi eventi in piu'.")
+    righe.append(f"> Regia e Algoritmo: {brand}")
     righe.append("")
+    righe.append("#generativeart #proceduralart #cellularautomaton #digitalminimalism")
+    righe.append("#computationalminimalism #brutalistart #glitchart #audiovisual")
+    righe.append("#experimentalvideo #beatglitch")
 
     return "\n".join(righe)
 
 
 
-import os, json, tempfile
+
+
+
+import os, json, tempfile, base64
 from datetime import datetime
 import streamlit as st
 try:
@@ -359,17 +419,10 @@ except ModuleNotFoundError:
     from moviepy import VideoClip, AudioFileClip  # moviepy 2.x
 import soundfile as sf
 
-st.set_page_config(page_title="Partitura — Loop507", layout="wide")
-st.title("◧ PARTITURA")
+st.set_page_config(page_title="BeatGlitch — Matrice Engine", layout="wide")
+st.title("◧ BEATGLITCH — MATRICE ENGINE")
 st.caption("Generazione audio-video procedurale da una struttura dati condivisa. "
            "MIDI, audio e video sono opzionali: senza input, il sistema genera da sé.")
-
-st.markdown("""
-<style>
-div[data-testid="stVideo"] { max-width: 380px; margin: 0 auto; }
-div[data-testid="stVideo"] video { max-width: 380px !important; }
-</style>
-""", unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -462,22 +515,22 @@ if audio_raw is not None:
     audio_mode_options += ["Originale (file caricato)", "Mix (generata + originale)"]
 audio_mode = st.radio("🎧 Colonna sonora finale", audio_mode_options, horizontal=True)
 st.caption("Nota: questo switch cambia solo l'audio che senti. Il video reagisce sempre "
-           "alla stessa partitura (gli stessi eventi), indipendentemente da quale "
+           "alla stessa matrice (gli stessi eventi), indipendentemente da quale "
            "colonna sonora scegli per il render finale.")
 
 # ------------------------------------------------------------
 # GENERAZIONE
 # ------------------------------------------------------------
 if st.button("🚀 GENERA", use_container_width=True):
-    with st.status("Costruzione partitura e rendering...", expanded=True) as status:
-        st.write("Combinazione delle fonti in un'unica partitura...")
+    with st.status("Costruzione matrice e rendering...", expanded=True) as status:
+        st.write("Combinazione delle fonti in un'unica matrice...")
         score = build_score(
             duration=duration, seed=int(seed), rule=rule,
             midi_events=midi_events,
             audio_events=audio_events, audio_env=audio_env,
             video_events=video_events, video_env=video_env,
         )
-        st.write(f"Partitura pronta — {len(score['events'])} eventi totali.")
+        st.write(f"Matrice pronta — {len(score['events'])} eventi totali.")
 
         st.write("Costruzione colonna sonora finale...")
         N = int(score["duration"] * SR)
@@ -542,19 +595,25 @@ if st.button("🚀 GENERA", use_container_width=True):
 if "result" in st.session_state:
     res = st.session_state["result"]
 
-    # anteprima video vincolata via CSS (vedi sopra), qui basta una colonna moderata
-    col_l, col_c, col_r = st.columns([1, 2, 1])
-    with col_c:
-        st.video(res["video_path"])
+    # embed diretto con larghezza fissa in pixel — più affidabile del CSS su st.video,
+    # che su alcune versioni di Streamlit viene sovrascritto dallo stile di default
+    with open(res["video_path"], "rb") as f:
+        video_b64 = base64.b64encode(f.read()).decode()
+    st.markdown(
+        f'<div style="text-align:center">'
+        f'<video width="360" controls src="data:video/mp4;base64,{video_b64}"></video>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     col_dl1, col_dl2 = st.columns(2)
     with open(res["video_path"], "rb") as f:
-        col_dl1.download_button("💾 Scarica video", f, file_name="partitura_output.mp4",
+        col_dl1.download_button("💾 Scarica video", f, file_name="beatglitch_output.mp4",
                                  use_container_width=True, key="dl_video")
     col_dl2.download_button("📄 Scarica report (txt)", res["report_text"],
-                             file_name="partitura_report.txt", mime="text/plain",
+                             file_name="beatglitch_report.txt", mime="text/plain",
                              use_container_width=True, key="dl_report")
 
-    st.sidebar.download_button("💾 Esporta partitura (info)",
+    st.sidebar.download_button("💾 Esporta matrice (info)",
                                 json.dumps(res["preset_export"], indent=2),
-                                "partitura_score_info.json", key="dl_json")
+                                "beatglitch_score_info.json", key="dl_json")
