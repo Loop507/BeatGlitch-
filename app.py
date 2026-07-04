@@ -58,7 +58,10 @@ def cellular_automaton(rule, width, steps, seed):
     return grid
 
 
-def generate_events_procedural(duration, seed, rule=30, width=81, max_per_row=5):
+def generate_events_procedural(duration, seed, rule=30, width=81, max_per_row=5, density_env=None):
+    """density_env: array opzionale 0..1 che modula nel tempo quanti eventi procedurali
+    vengono mantenuti (usato per far reagire la texture di base alla dinamica dell'audio,
+    invece di essere sempre identica indipendentemente dal brano caricato)."""
     steps = max(20, int(duration * 8))
     grid = cellular_automaton(rule, width, steps, seed)
     events = []
@@ -67,7 +70,12 @@ def generate_events_procedural(duration, seed, rule=30, width=81, max_per_row=5)
         if len(active) == 0:
             continue
         t = (i / steps) * duration
-        for a in active[:max_per_row]:
+        if density_env is not None:
+            idx = min(len(density_env) - 1, int((i / steps) * len(density_env)))
+            row_cap = max(1, int(max_per_row * density_env[idx]))
+        else:
+            row_cap = max_per_row
+        for a in active[:row_cap]:
             pitch = 36 + int((a / width) * 48)
             events.append({
                 "t": float(t),
@@ -166,18 +174,33 @@ def extract_from_video(video_path):
 # 3. COMBINAZIONE — costruzione della partitura condivisa
 # ============================================================
 
+def _content_seed_offset(audio_env, video_env, midi_events):
+    """Deriva un offset di seed dal contenuto reale delle fonti esterne, così brani/video
+    diversi con lo stesso seed utente producono comunque un automa cellulare diverso —
+    invece che sempre lo stesso, con solo pochi eventi colorati sparsi sopra."""
+    acc = 0.0
+    if audio_env is not None and len(audio_env) > 0:
+        acc += float(np.sum(audio_env) * 997)
+    if video_env is not None and len(video_env) > 0:
+        acc += float(np.sum(video_env) * 613)
+    if midi_events:
+        acc += sum(e["pitch"] for e in midi_events) * 31
+    return int(acc) % 100000
+
+
 def build_score(duration, seed, rule=30,
                  midi_events=None,
                  audio_events=None, audio_env=None,
                  video_events=None, video_env=None,
                  resolution=200):
-    events = list(generate_events_procedural(duration, seed, rule=rule))
-    for extra in (midi_events, audio_events, video_events):
-        if extra:
-            events += extra
-    events.sort(key=lambda e: e["t"])
+    has_external = bool(midi_events or audio_events or video_events)
 
-    macro = generate_macro_envelope_procedural(duration, seed, resolution)
+    # il seed "di base" pilotato dall'utente resta riproducibile, ma viene perturbato
+    # dal contenuto reale delle fonti esterne, in modo che due brani diversi diano
+    # davvero pattern procedurali diversi, non solo pochi eventi colorati in più
+    effective_seed = seed + _content_seed_offset(audio_env, video_env, midi_events)
+
+    macro = generate_macro_envelope_procedural(duration, effective_seed, resolution)
     external_envs = [e for e in (audio_env, video_env) if e is not None and len(e) > 1]
     if external_envs:
         resampled = [
@@ -187,11 +210,23 @@ def build_score(duration, seed, rule=30,
         combined_ext = np.mean(resampled, axis=0)
         macro = 0.4 * macro + 0.6 * combined_ext  # gli esterni pesano di più se presenti
 
-    texture = generate_micro_texture_procedural(resolution * 4, seed)
+    # quando ci sono fonti esterne, la texture procedurale fa da "base" più leggera,
+    # modulata nel tempo dalla stessa dinamica del brano/video (non più costante fissa)
+    max_per_row = 2 if has_external else 5
+    density_env = macro if has_external else None
+    events = list(generate_events_procedural(
+        duration, effective_seed, rule=rule, max_per_row=max_per_row, density_env=density_env
+    ))
+    for extra in (midi_events, audio_events, video_events):
+        if extra:
+            events += extra
+    events.sort(key=lambda e: e["t"])
+
+    texture = generate_micro_texture_procedural(resolution * 4, effective_seed)
 
     return {
         "duration": duration,
-        "seed": seed,
+        "seed": effective_seed,
         "events": events,
         "macro_envelope": macro,
         "micro_texture": texture,
@@ -220,7 +255,8 @@ def render_frame(t, score, width=960, height=540):
         prog = (t - e["t"]) / max(e["dur"], 0.05)
         h = int(height * (0.15 + 0.8 * e["vel"]) * (1 - prog * 0.3))
         color = SOURCE_COLOR.get(e["source"], (255, 255, 255))
-        bar_w = max(2, int(6 * (0.5 + macro_v)))
+        prominence = 1.0 if e["source"] == "ca" else 1.6  # le fonti esterne risaltano di più
+        bar_w = max(2, int(6 * (0.5 + macro_v) * prominence))
         y0 = height // 2 - h // 2
         cv2.rectangle(frame, (x, y0), (x + bar_w, y0 + max(h, 2)), color, -1)
 
@@ -274,98 +310,43 @@ def fit_audio_length(y, N):
     return np.tile(y, int(np.ceil(N / len(y))))[:N]
 
 
-def generate_pdf_report(out_path, params, score, brand="Loop507"):
-    """Report tecnico in stile Loop507 (sfondo scuro, dati essenziali sull'opera generata)."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas as pdf_canvas
-    from reportlab.lib.units import mm
-
-    W, H = A4
-    c = pdf_canvas.Canvas(out_path, pagesize=A4)
-
-    # sfondo scuro
-    c.setFillColorRGB(0.05, 0.05, 0.05)
-    c.rect(0, 0, W, H, fill=1, stroke=0)
-
-    margin = 20 * mm
-    y_cur = H - margin
-
-    c.setFillColorRGB(0.95, 0.95, 0.95)
-    c.setFont("Courier-Bold", 20)
-    c.drawString(margin, y_cur, f":: PARTITURA — {brand}")
-    y_cur -= 10 * mm
-
-    c.setFont("Courier", 9)
-    c.setFillColorRGB(0.6, 0.6, 0.6)
-    c.drawString(margin, y_cur, f"Report tecnico generato il {params['timestamp']}")
-    y_cur -= 12 * mm
-
-    c.setStrokeColorRGB(0.3, 0.3, 0.3)
-    c.line(margin, y_cur, W - margin, y_cur)
-    y_cur -= 10 * mm
-
-    c.setFillColorRGB(0.9, 0.9, 0.9)
-    c.setFont("Courier-Bold", 12)
-    c.drawString(margin, y_cur, "PARAMETRI GENERATIVI")
-    y_cur -= 8 * mm
-
-    c.setFont("Courier", 10)
-    righe = [
-        f"Seed:              {params['seed']}",
-        f"Regola automa:     {params['rule']}",
-        f"Durata:            {params['duration']:.1f}s",
-        f"Risoluzione:       {params['resolution']}",
-        f"Colonna sonora:    {params['audio_mode']}",
-        f"Eventi totali:     {len(score['events'])}",
-    ]
-    for r in righe:
-        c.drawString(margin, y_cur, r)
-        y_cur -= 6.5 * mm
-
-    y_cur -= 6 * mm
-    c.setFont("Courier-Bold", 12)
-    c.drawString(margin, y_cur, "FONTI DEGLI EVENTI")
-    y_cur -= 9 * mm
-
+def generate_text_report(params, score, brand="Loop507"):
+    """Report tecnico in stile Loop507 (':: ' prefix, testo semplice) — nessuna dipendenza extra."""
     counts = {}
     for e in score["events"]:
         counts[e["source"]] = counts.get(e["source"], 0) + 1
 
     labels = {"ca": "Procedurale (automa cellulare)", "midi": "MIDI",
               "audio": "Audio", "video": "Video"}
-    c.setFont("Courier", 10)
+
+    righe = []
+    righe.append(f":: PARTITURA — {brand}")
+    righe.append(f"Report tecnico generato il {params['timestamp']}")
+    righe.append("-" * 60)
+    righe.append("")
+    righe.append(":: PARAMETRI GENERATIVI")
+    righe.append(f"Seed (utente):     {params['seed']}")
+    righe.append(f"Seed effettivo:    {score['seed']}  (perturbato dal contenuto delle fonti esterne)")
+    righe.append(f"Regola automa:     {params['rule']}")
+    righe.append(f"Durata:            {params['duration']:.1f}s")
+    righe.append(f"Risoluzione:       {params['resolution']}")
+    righe.append(f"Colonna sonora:    {params['audio_mode']}")
+    righe.append(f"Eventi totali:     {len(score['events'])}")
+    righe.append("")
+    righe.append(":: FONTI DEGLI EVENTI")
     for key, label in labels.items():
-        n = counts.get(key, 0)
-        r, g, b = SOURCE_COLOR[key]
-        c.setFillColorRGB(r / 255, g / 255, b / 255)
-        c.rect(margin, y_cur - 3, 4 * mm, 4 * mm, fill=1, stroke=0)
-        c.setFillColorRGB(0.85, 0.85, 0.85)
-        c.drawString(margin + 7 * mm, y_cur, f"{label}: {n} eventi")
-        y_cur -= 7 * mm
+        righe.append(f"  {label}: {counts.get(key, 0)} eventi")
+    righe.append("")
+    righe.append("-" * 60)
+    righe.append(":: CONCETTO")
+    righe.append("Un'unica struttura dati astratta (la partitura) genera contemporaneamente")
+    righe.append("la parte visiva e quella sonora dell'opera. Le fonti esterne opzionali")
+    righe.append("(MIDI, audio, video) alimentano ruoli specifici della partitura e ne")
+    righe.append("perturbano anche il motore procedurale di base, cosi' che fonti diverse")
+    righe.append("producano davvero pattern diversi, non solo pochi eventi in piu'.")
+    righe.append("")
 
-    y_cur -= 8 * mm
-    c.setStrokeColorRGB(0.3, 0.3, 0.3)
-    c.line(margin, y_cur, W - margin, y_cur)
-    y_cur -= 10 * mm
-
-    c.setFont("Courier-Bold", 12)
-    c.setFillColorRGB(0.9, 0.9, 0.9)
-    c.drawString(margin, y_cur, "CONCETTO")
-    y_cur -= 8 * mm
-    c.setFont("Courier", 9)
-    c.setFillColorRGB(0.75, 0.75, 0.75)
-    testo = [
-        "Un'unica struttura dati astratta (la partitura) genera contemporaneamente",
-        "la parte visiva e quella sonora dell'opera. Le fonti esterne opzionali",
-        "(MIDI, audio, video) alimentano ruoli specifici della partitura senza",
-        "sostituire il motore procedurale di base, che resta sempre attivo.",
-    ]
-    for riga in testo:
-        c.drawString(margin, y_cur, riga)
-        y_cur -= 5.5 * mm
-
-    c.showPage()
-    c.save()
+    return "\n".join(righe)
 
 
 
@@ -382,6 +363,13 @@ st.set_page_config(page_title="Partitura — Loop507", layout="wide")
 st.title("◧ PARTITURA")
 st.caption("Generazione audio-video procedurale da una struttura dati condivisa. "
            "MIDI, audio e video sono opzionali: senza input, il sistema genera da sé.")
+
+st.markdown("""
+<style>
+div[data-testid="stVideo"] { max-width: 380px; margin: 0 auto; }
+div[data-testid="stVideo"] video { max-width: 380px !important; }
+</style>
+""", unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -523,14 +511,13 @@ if st.button("🚀 GENERA", use_container_width=True):
         clip.write_videofile(out_path, codec="libx264", audio_codec="aac",
                               fps=FPS, logger=None)
 
-        st.write("Generazione report PDF...")
+        st.write("Generazione report...")
         report_params = {
             "seed": int(seed), "rule": rule, "duration": score["duration"],
             "resolution": f"{export_w}x{export_h}", "audio_mode": audio_mode,
             "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M"),
         }
-        pdf_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-        generate_pdf_report(pdf_path, report_params, score)
+        report_text = generate_text_report(report_params, score)
 
         status.update(label="Fatto!", state="complete")
 
@@ -538,7 +525,7 @@ if st.button("🚀 GENERA", use_container_width=True):
     # così video e report non spariscono l'uno cliccando sull'altro
     st.session_state["result"] = {
         "video_path": out_path,
-        "pdf_path": pdf_path,
+        "report_text": report_text,
         "preset_export": {
             "seed": int(seed), "rule": rule, "duration": score["duration"],
             "n_events": len(score["events"]),
@@ -555,7 +542,7 @@ if st.button("🚀 GENERA", use_container_width=True):
 if "result" in st.session_state:
     res = st.session_state["result"]
 
-    # anteprima video confinata in una colonna centrale più stretta
+    # anteprima video vincolata via CSS (vedi sopra), qui basta una colonna moderata
     col_l, col_c, col_r = st.columns([1, 2, 1])
     with col_c:
         st.video(res["video_path"])
@@ -564,9 +551,9 @@ if "result" in st.session_state:
     with open(res["video_path"], "rb") as f:
         col_dl1.download_button("💾 Scarica video", f, file_name="partitura_output.mp4",
                                  use_container_width=True, key="dl_video")
-    with open(res["pdf_path"], "rb") as f:
-        col_dl2.download_button("📄 Scarica report PDF", f, file_name="partitura_report.pdf",
-                                 use_container_width=True, key="dl_pdf")
+    col_dl2.download_button("📄 Scarica report (txt)", res["report_text"],
+                             file_name="partitura_report.txt", mime="text/plain",
+                             use_container_width=True, key="dl_report")
 
     st.sidebar.download_button("💾 Esporta partitura (info)",
                                 json.dumps(res["preset_export"], indent=2),
