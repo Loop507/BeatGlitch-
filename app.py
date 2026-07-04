@@ -1,175 +1,263 @@
-import time, json, os, tempfile
+"""
+IKEDA ENGINE — motore generativo audio/video "alla Ikeda"
+Genera una PARTITURA astratta (procedurale e/o da MIDI/audio/video esterni)
+e la trasforma sia in geometria visiva sia in sintesi sonora, dallo stesso dato.
+"""
 import numpy as np
 import cv2
-import librosa
-import soundfile as sf
-import streamlit as st
-from moviepy.editor import VideoFileClip, AudioFileClip
 
-# --- 1. ANALISI SENSORI VIDEO ---
-def analyze_video_v10(video_path):
+SR = 44100
+FPS = 30
+
+SOURCE_COLOR = {
+    "ca":    (235, 235, 235),   # procedurale — bianco/grigio
+    "midi":  (255, 180, 0),     # ambra/oro
+    "audio": (255, 40, 140),    # magenta
+    "video": (0, 210, 255),     # ciano
+}
+
+# ============================================================
+# 1. GENERATORI PROCEDURALI (usati come default / fallback)
+# ============================================================
+
+def value_noise_1d(n_points, seed, octaves=5, persistence=0.55, base_freq=3):
+    """Rumore smussato multi-ottava, senza dipendenze esterne (sostituisce Perlin)."""
+    rng = np.random.RandomState(seed)
+    t = np.linspace(0, 1, n_points)
+    signal = np.zeros(n_points)
+    amp, freq, max_amp = 1.0, base_freq, 0.0
+    for _ in range(octaves):
+        n_anchors = max(2, int(freq))
+        anchors = rng.uniform(0, 1, n_anchors)
+        anchor_t = np.linspace(0, 1, n_anchors)
+        signal += amp * np.interp(t, anchor_t, anchors)
+        max_amp += amp
+        amp *= persistence
+        freq *= 2
+    return signal / max_amp
+
+
+def generate_macro_envelope_procedural(duration, seed, resolution=200):
+    env = value_noise_1d(resolution, seed)
+    return (env - env.min()) / (env.max() - env.min() + 1e-9)
+
+
+def cellular_automaton(rule, width, steps, seed):
+    rng = np.random.RandomState(seed)
+    row = rng.randint(0, 2, width)
+    row[width // 2] = 1
+    rule_bits = np.array([(rule >> i) & 1 for i in range(8)])
+    grid = np.zeros((steps, width), dtype=np.uint8)
+    grid[0] = row
+    for i in range(1, steps):
+        left, right = np.roll(row, 1), np.roll(row, -1)
+        idx = (left * 4 + row * 2 + right).astype(int)
+        row = rule_bits[idx]
+        grid[i] = row
+    return grid
+
+
+def generate_events_procedural(duration, seed, rule=30, width=81, max_per_row=5):
+    steps = max(20, int(duration * 8))
+    grid = cellular_automaton(rule, width, steps, seed)
+    events = []
+    for i in range(steps):
+        active = np.where(grid[i] == 1)[0]
+        if len(active) == 0:
+            continue
+        t = (i / steps) * duration
+        for a in active[:max_per_row]:
+            pitch = 36 + int((a / width) * 48)
+            events.append({
+                "t": float(t),
+                "dur": float(duration / steps) * 1.5,
+                "pitch": pitch,
+                "vel": 0.55,
+                "source": "ca",
+            })
+    return events
+
+
+def prime_sequence(n):
+    primes, candidate = [], 2
+    while len(primes) < n:
+        if all(candidate % p != 0 for p in primes if p * p <= candidate):
+            primes.append(candidate)
+        candidate += 1
+    return np.array(primes)
+
+
+def generate_micro_texture_procedural(n_points, seed):
+    primes = prime_sequence(n_points)
+    tex = (primes % 97) / 97.0
+    rng = np.random.RandomState(seed)
+    return tex * 0.7 + rng.uniform(0, 1, n_points) * 0.3
+
+
+# ============================================================
+# 2. ESTRATTORI DA INPUT ESTERNI (opzionali)
+# ============================================================
+
+def extract_from_midi(midi_path):
+    import pretty_midi
+    pm = pretty_midi.PrettyMIDI(midi_path)
+    duration = pm.get_end_time()
+    events = []
+    for inst_i, inst in enumerate(pm.instruments):
+        for note in inst.notes:
+            events.append({
+                "t": float(note.start),
+                "dur": float(max(0.05, note.end - note.start)),
+                "pitch": int(note.pitch),
+                "vel": float(note.velocity) / 127.0,
+                "source": "midi",
+            })
+    return events, duration
+
+
+def extract_from_audio(audio_path):
+    import librosa
+    y, sr = librosa.load(audio_path, sr=SR, mono=True)
+    duration = len(y) / sr
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr)
+    rms = librosa.feature.rms(y=y)[0]
+    rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
+
+    events = []
+    for ot in onset_times:
+        idx = int(np.argmin(np.abs(rms_times - ot)))
+        vel = float(min(1.0, rms[idx] / (rms.max() + 1e-9)))
+        events.append({"t": float(ot), "dur": 0.15, "pitch": 60, "vel": vel, "source": "audio"})
+
+    env = rms / (rms.max() + 1e-9)
+    return events, env, duration
+
+
+def extract_from_video(video_path):
     cap = cv2.VideoCapture(video_path)
-    sig = {"lum": [], "mot": [], "hue": [], "var": []}
-    prev_gray = None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    prev_gray, motion, cuts_t, frame_i = None, [], [], 0
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret: break
-        img = cv2.resize(frame, (100, 75))
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        sig["lum"].append(np.mean(gray) / 255.0)
-        sig["hue"].append(np.mean(hsv[:,:,0]) / 180.0)
+        if not ret:
+            break
+        small = cv2.resize(frame, (80, 60))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         if prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray)
-            m = np.mean(diff) / 255.0
-            sig["mot"].append(m)
-            sig["var"].append(abs(m - (sig["mot"][-2] if len(sig["mot"]) > 1 else 0)))
+            diff = float(np.mean(cv2.absdiff(gray, prev_gray)) / 255.0)
+            motion.append(diff)
+            if diff > 0.35:
+                cuts_t.append(frame_i / fps)
         else:
-            sig["mot"].append(0.0)
-            sig["var"].append(0.0)
+            motion.append(0.0)
         prev_gray = gray
+        frame_i += 1
     cap.release()
-    for k in sig:
-        arr = np.array(sig[k])
-        sig[k] = (arr - arr.min()) / (arr.max() - arr.min() + 1e-6)
-    return sig
+    duration = frame_i / fps if fps else 0
+    motion = np.array(motion) if motion else np.zeros(1)
+    motion = motion / (motion.max() + 1e-9)
+    events = [{"t": float(t), "dur": 0.3, "pitch": 48, "vel": 0.7, "source": "video"} for t in cuts_t]
+    return events, motion, duration
 
-# --- 2. MOTORE DI DISTRUZIONE (FIXED SYNTAX) ---
-def generate_v10_engine(video_path, audio_ext_path, sig, duration, p, sr=44100):
-    np.random.seed(int(p["seed"]))
+
+# ============================================================
+# 3. COMBINAZIONE — costruzione della partitura condivisa
+# ============================================================
+
+def build_score(duration, seed, rule=30,
+                 midi_events=None,
+                 audio_events=None, audio_env=None,
+                 video_events=None, video_env=None,
+                 resolution=200):
+    events = list(generate_events_procedural(duration, seed, rule=rule))
+    for extra in (midi_events, audio_events, video_events):
+        if extra:
+            events += extra
+    events.sort(key=lambda e: e["t"])
+
+    macro = generate_macro_envelope_procedural(duration, seed, resolution)
+    external_envs = [e for e in (audio_env, video_env) if e is not None and len(e) > 1]
+    if external_envs:
+        resampled = [
+            np.interp(np.linspace(0, 1, resolution), np.linspace(0, 1, len(e)), e)
+            for e in external_envs
+        ]
+        combined_ext = np.mean(resampled, axis=0)
+        macro = 0.4 * macro + 0.6 * combined_ext  # gli esterni pesano di più se presenti
+
+    texture = generate_micro_texture_procedural(resolution * 4, seed)
+
+    return {
+        "duration": duration,
+        "seed": seed,
+        "events": events,
+        "macro_envelope": macro,
+        "micro_texture": texture,
+    }
+
+
+# ============================================================
+# 4. GENERATORE VISIVO
+# ============================================================
+
+def render_frame(t, score, width=960, height=540):
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+
+    # griglia sottile di fondo — rigore/struttura sempre visibile
+    grid_alpha = int(12 + macro_v * 18)
+    for gx in range(0, width, 40):
+        frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
+
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    for e in active:
+        x = int((e["pitch"] % 96) / 96 * (width - 10))
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        h = int(height * (0.15 + 0.8 * e["vel"]) * (1 - prog * 0.3))
+        color = SOURCE_COLOR.get(e["source"], (255, 255, 255))
+        bar_w = max(2, int(6 * (0.5 + macro_v)))
+        y0 = height // 2 - h // 2
+        cv2.rectangle(frame, (x, y0), (x + bar_w, y0 + max(h, 2)), color, -1)
+
+    return frame
+
+
+# ============================================================
+# 5. GENERATORE AUDIO
+# ============================================================
+
+def synthesize_audio(score, sr=SR):
+    duration = max(score["duration"], 0.1)
     N = int(duration * sr)
+    out = np.zeros(N)
     t_ax = np.linspace(0, duration, N)
-    
-    mot = np.interp(t_ax, np.linspace(0, duration, len(sig["mot"])), sig["mot"])
-    var = np.interp(t_ax, np.linspace(0, duration, len(sig["var"])), sig["var"])
-    lum = np.interp(t_ax, np.linspace(0, duration, len(sig["lum"])), sig["lum"])
-    hue = np.interp(t_ax, np.linspace(0, duration, len(sig["hue"])), sig["hue"])
 
-    try:
-        path = audio_ext_path if audio_ext_path else video_path
-        y_src, _ = librosa.load(path, sr=sr, mono=True)
-        if len(y_src) > N: 
-            y_src = y_src[:N]
-        else: 
-            y_src = np.tile(y_src, int(np.ceil(N/len(y_src))))[:N]
-        if np.max(np.abs(y_src)) < 1e-3: 
-            raise ValueError("Vuoto")
-    except:
-        y_src = np.random.uniform(-0.2, 0.2, N) * lum
+    env_full = np.interp(t_ax, np.linspace(0, duration, len(score["macro_envelope"])), score["macro_envelope"])
+    tex_full = np.interp(t_ax, np.linspace(0, duration, len(score["micro_texture"])), score["micro_texture"])
 
-    out_glitch = np.zeros(N)
-    s_len = int(sr * (p["stutter_ms"] / 1000.0))
-    idx = 0
-    while idx < N - max(s_len * p["stutter_reps"], 2000):
-        # Trigger Disco Rotto (Variazione)
-        if (var[idx] * p["intensity"]) > 0.8:
-            frag = y_src[idx : idx + s_len].copy()
-            res = max(2, int(2 + (1-p["grit"])*16))
-            frag = np.round(frag * res) / res
-            for r in range(p["stutter_reps"]):
-                pos = idx + (r * s_len)
-                if pos + s_len < N:
-                    out_glitch[pos : pos + s_len] += frag * np.hanning(s_len) * p["v_mix"]
-            idx += s_len * p["stutter_reps"]
-        # Trigger Granulare (Movimento)
-        elif (mot[idx] * p["intensity"]) > 0.1:
-            g_len = int(sr * np.random.uniform(0.005, 0.04))
-            grain = y_src[idx : idx + g_len].copy()
-            res = max(2, int(2 + (1-p["grit"]) * 20 * (1-hue[idx])))
-            grain = np.round(grain * res) / res
-            out_glitch[idx : idx + g_len] += grain * np.hanning(g_len) * p["v_mix"] * (mot[idx] * p["intensity"])
-            idx += int(sr * 0.002)
-        else:
-            idx += int(sr * 0.005)
+    # drone macro — frequenza istantanea integrata correttamente (fase continua)
+    base_freq = 55.0
+    drone_freq = base_freq * (1 + tex_full * 0.5)
+    phase = 2 * np.pi * np.cumsum(drone_freq) / sr
+    drone = np.sin(phase) * (0.06 + 0.10 * env_full)
+    out += drone
 
-    # Drone Armonico
-    f_drone = 40 + (hue * 120) 
-    drone_wave = np.sin(2 * np.pi * f_drone * t_ax) * p.get("drone_vol", 0.15) * lum
-    
-    # Mix finale
-    final_mono = (y_src * p["v_orig_vol"]) + (out_glitch * 0.7) + (drone_wave * 0.3)
-    final_stereo = np.tile(np.clip(final_mono, -1.0, 1.0), (2, 1))
-    
-    return final_stereo
+    # eventi discreti — ogni fonte ha lo stesso motore di sintesi (stessa "grammatica")
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.03 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 440.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        wave = np.sin(2 * np.pi * freq * seg_t) * e["vel"]
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        out[start:end] += wave * env_local * 0.45
 
-# --- 3. INTERFACCIA ---
-st.set_page_config(page_title="BeatGlitch V10 Pro", layout="wide")
-st.title("🌪️ BeatGlitch V10 Pro: Quantum Shredder")
-
-presets_lib = {
-    "Default (Bilanciato)": {"v_orig_vol": 0.3, "v_mix": 2.5, "stutter_ms": 45, "stutter_reps": 12, "intensity": 1.5, "grit": 0.6, "drone_vol": 0.15, "seed": 42},
-    "Disco Rotto": {"v_orig_vol": 0.1, "v_mix": 3.5, "stutter_ms": 80, "stutter_reps": 25, "intensity": 2.0, "grit": 0.4, "drone_vol": 0.10, "seed": 77},
-    "Cyber-Noise": {"v_orig_vol": 0.0, "v_mix": 4.5, "stutter_ms": 15, "stutter_reps": 8, "intensity": 3.5, "grit": 0.95, "drone_vol": 0.25, "seed": 666},
-    "Ghost (Sussurri)": {"v_orig_vol": 0.05, "v_mix": 1.5, "stutter_ms": 120, "stutter_reps": 4, "intensity": 1.0, "grit": 0.2, "drone_vol": 0.30, "seed": 101},
-    "Radio Interferenza": {"v_orig_vol": 0.2, "v_mix": 3.0, "stutter_ms": 5, "stutter_reps": 40, "intensity": 2.5, "grit": 0.98, "drone_vol": 0.05, "seed": 9},
-    "Glitch-Hop Beats": {"v_orig_vol": 0.4, "v_mix": 3.0, "stutter_ms": 30, "stutter_reps": 16, "intensity": 2.2, "grit": 0.5, "drone_vol": 0.10, "seed": 2024},
-    "Deep Drone": {"v_orig_vol": 0.1, "v_mix": 2.0, "stutter_ms": 200, "stutter_reps": 2, "intensity": 1.2, "grit": 0.8, "drone_vol": 0.50, "seed": 88},
-    "Vinyl Scratch": {"v_orig_vol": 0.15, "v_mix": 4.0, "stutter_ms": 10, "stutter_reps": 30, "intensity": 3.0, "grit": 0.7, "drone_vol": 0.05, "seed": 13}
-}
-
-with st.sidebar:
-    st.header("📂 Sorgenti")
-    v_file = st.file_uploader("Video", type=["mp4", "mov"])
-    a_file = st.file_uploader("Audio Esterno", type=["mp3", "wav"])
-    st.markdown("---")
-    preset_upload = st.file_uploader("Carica Preset JSON", type="json")
-    if preset_upload: 
-        try:
-            config = json.load(preset_upload)
-        except:
-            config = presets_lib["Default (Bilanciato)"]
-    else:
-        sel = st.selectbox("🎯 Preset", list(presets_lib.keys()))
-        config = presets_lib[sel]
-
-st.subheader("🎛️ Pannello di Controllo")
-c1, c2, c3 = st.columns(3)
-with c1:
-    v_orig_vol = st.slider("Volume Originale", 0.0, 1.0, float(config.get("v_orig_vol", 0.3)))
-    v_mix = st.slider("Potenza Glitch", 0.0, 5.0, float(config.get("v_mix", 2.5)))
-    drone_vol = st.slider("Volume Drone", 0.0, 1.0, float(config.get("drone_vol", 0.15)))
-with c2:
-    stutter_ms = st.slider("Loop ms", 5, 250, int(config.get("stutter_ms", 45)))
-    stutter_reps = st.slider("Ripetizioni", 1, 60, int(config.get("stutter_reps", 12)))
-    seed_val = st.number_input("🎲 Seed", value=int(config.get("seed", 42)))
-with c3:
-    intensity = st.slider("Sensibilità", 0.1, 4.0, float(config.get("intensity", 1.5)))
-    grit = st.slider("Grit", 0.0, 1.0, float(config.get("grit", 0.6)))
-
-current_params = {
-    "v_orig_vol": v_orig_vol, "v_mix": v_mix, "stutter_ms": stutter_ms, 
-    "stutter_reps": stutter_reps, "intensity": intensity, 
-    "grit": grit, "drone_vol": drone_vol, "seed": seed_val
-}
-
-st.sidebar.download_button("💾 Salva Preset", json.dumps(current_params), "preset_glitch.json")
-
-if v_file:
-    if st.button("🚀 GENERA REMIX V10", use_container_width=True):
-        with st.status("Elaborazione...") as s:
-            t_v = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            t_v.write(v_file.read())
-            t_v_name = t_v.name
-            t_v.close()
-            
-            t_a_ext_name = None
-            if a_file:
-                t_a = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                t_a.write(a_file.read())
-                t_a_ext_name = t_a.name
-                t_a.close()
-            
-            sig = analyze_video_v10(t_v_name)
-            clip = VideoFileClip(t_v_name)
-            audio_data = generate_v10_engine(t_v_name, t_a_ext_name, sig, clip.duration, current_params)
-            
-            t_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            sf.write(t_wav.name, audio_data.T, 44100)
-            t_wav.close()
-            
-            out_name = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-            final_clip = clip.set_audio(AudioFileClip(t_wav.name))
-            final_clip.write_videofile(out_name, codec="libx264", audio_codec="aac", logger=None)
-            
-            st.video(out_name)
-            s.update(label="Fatto!", state="complete")
+    out = np.clip(out, -1.0, 1.0)
+    return np.tile(out, (2, 1))
