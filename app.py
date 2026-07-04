@@ -473,6 +473,9 @@ audio_mode_options = ["Generata (sintesi)"]
 if audio_raw is not None:
     audio_mode_options += ["Originale (file caricato)", "Mix (generata + originale)"]
 audio_mode = st.radio("🎧 Colonna sonora finale", audio_mode_options, horizontal=True)
+st.caption("Nota: questo switch cambia solo l'audio che senti. Il video reagisce sempre "
+           "alla stessa partitura (gli stessi eventi), indipendentemente da quale "
+           "colonna sonora scegli per il render finale.")
 
 # ------------------------------------------------------------
 # GENERAZIONE
@@ -531,22 +534,40 @@ if st.button("🚀 GENERA", use_container_width=True):
 
         status.update(label="Fatto!", state="complete")
 
-    st.video(out_path)
-    col_dl1, col_dl2 = st.columns(2)
-    with open(out_path, "rb") as f:
-        col_dl1.download_button("💾 Scarica video", f, file_name="partitura_output.mp4",
-                                 use_container_width=True)
-    with open(pdf_path, "rb") as f:
-        col_dl2.download_button("📄 Scarica report PDF", f, file_name="partitura_report.pdf",
-                                 use_container_width=True)
-
-    preset_export = {
-        "seed": int(seed), "rule": rule, "duration": score["duration"],
-        "n_events": len(score["events"]),
-        "sources_used": sorted(set(e["source"] for e in score["events"])),
-        "risoluzione": f"{export_w}x{export_h}",
-        "colonna_sonora": audio_mode,
+    # salvo tutto in session_state: sopravvive ai rerun causati dai download_button,
+    # così video e report non spariscono l'uno cliccando sull'altro
+    st.session_state["result"] = {
+        "video_path": out_path,
+        "pdf_path": pdf_path,
+        "preset_export": {
+            "seed": int(seed), "rule": rule, "duration": score["duration"],
+            "n_events": len(score["events"]),
+            "sources_used": sorted(set(e["source"] for e in score["events"])),
+            "risoluzione": f"{export_w}x{export_h}",
+            "colonna_sonora": audio_mode,
+        },
     }
+
+# ------------------------------------------------------------
+# VISUALIZZAZIONE RISULTATI — fuori dal blocco del pulsante,
+# così un download non fa sparire l'altro
+# ------------------------------------------------------------
+if "result" in st.session_state:
+    res = st.session_state["result"]
+
+    # anteprima video confinata in una colonna centrale più stretta
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        st.video(res["video_path"])
+
+    col_dl1, col_dl2 = st.columns(2)
+    with open(res["video_path"], "rb") as f:
+        col_dl1.download_button("💾 Scarica video", f, file_name="partitura_output.mp4",
+                                 use_container_width=True, key="dl_video")
+    with open(res["pdf_path"], "rb") as f:
+        col_dl2.download_button("📄 Scarica report PDF", f, file_name="partitura_report.pdf",
+                                 use_container_width=True, key="dl_pdf")
+
     st.sidebar.download_button("💾 Esporta partitura (info)",
-                                json.dumps(preset_export, indent=2),
-                                "partitura_score_info.json")
+                                json.dumps(res["preset_export"], indent=2),
+                                "partitura_score_info.json", key="dl_json")
