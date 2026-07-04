@@ -26,13 +26,25 @@ PALETTES = {
     "Bianco":  (240, 240, 240),
     "Ambra":   (255, 170, 0),
     "Verde":   (60, 220, 120),
+    "Per banda (bassi/medi/alti)": "BAND",
+}
+
+DEFAULT_BAND_COLORS = {
+    "bass": (235, 40, 40),     # rosso
+    "mid": (255, 170, 0),      # ambra
+    "treble": (0, 200, 255),   # ciano
 }
 
 
-def get_event_color(e, palette_name):
-    base = PALETTES.get(palette_name)
-    if base is None:  # multicolore per fonte
+def get_event_color(e, palette_name, band_colors=None):
+    setting = PALETTES.get(palette_name)
+    if setting == "BAND":
+        bc = band_colors or DEFAULT_BAND_COLORS
+        base = bc.get(e.get("band"), (235, 235, 235))  # fonti senza banda -> grigio chiaro
+    elif setting is None:  # multicolore per fonte
         base = SOURCE_COLOR.get(e["source"], (255, 255, 255))
+    else:
+        base = setting
     factor = 0.45 + 0.55 * e.get("vel", 0.6)  # più intenso = più luminoso
     return tuple(min(255, int(c * factor)) for c in base)
 
@@ -312,20 +324,33 @@ def _lane_fraction(e):
     return (e["pitch"] % 96) / 96.0
 
 
+def _event_orientation(e, mode):
+    """In modalità 'misto' (V+H) ogni evento sceglie il proprio asse: i bassi restano
+    verticali (sostenuti), gli alti orizzontali (rapidi), i medi si alternano nel tempo."""
+    if mode != "misto":
+        return mode
+    band = e.get("band")
+    if band == "bass":
+        return "verticale"
+    if band == "treble":
+        return "orizzontale"
+    return "verticale" if int(e["t"] * 10) % 2 == 0 else "orizzontale"
+
+
 def render_frame(t, score, width=960, height=540, orientation="verticale",
-                  num_lanes=10, palette="Multicolore (per fonte)"):
+                  num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     res = len(score["macro_envelope"])
     env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
     macro_v = float(score["macro_envelope"][env_idx])
 
-    # griglia sottile di fondo, orientata come le corsie — rigore sempre visibile
+    # griglia sottile di fondo — in modalità mista mostra entrambi gli assi
     grid_alpha = int(12 + macro_v * 18)
-    if orientation == "verticale":
+    if orientation in ("verticale", "misto"):
         grid_step = max(8, width // 24)
         for gx in range(0, width, grid_step):
             frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
-    else:
+    if orientation in ("orizzontale", "misto"):
         grid_step = max(8, height // 24)
         for gy in range(0, height, grid_step):
             frame[gy, :] = (grid_alpha, grid_alpha, grid_alpha)
@@ -335,7 +360,7 @@ def render_frame(t, score, width=960, height=540, orientation="verticale",
 
     for e in active:
         prog = (t - e["t"]) / max(e["dur"], 0.05)
-        color = get_event_color(e, palette)
+        color = get_event_color(e, palette, band_colors)
 
         band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
             (1.0 if e["source"] == "ca" else 1.6)
@@ -347,8 +372,9 @@ def render_frame(t, score, width=960, height=540, orientation="verticale",
         lane_idx = int(lane_frac * num_lanes)
 
         extent_frac = (0.2 + 0.75 * e["vel"]) * (1 - prog * 0.3)  # lunghezza della barra
+        event_orientation = _event_orientation(e, orientation)
 
-        if orientation == "verticale":
+        if event_orientation == "verticale":
             lane_w = width / num_lanes
             x_center = lane_idx * lane_w + lane_w / 2
             bar_w = int(np.clip(lane_w * 0.55 * thickness_factor, 3, lane_w * 0.95))
@@ -544,10 +570,31 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🎨 Aspetto visivo")
-    orientamento_label = st.radio("Orientamento linee", ["Verticali", "Orizzontali"], horizontal=True)
-    orientamento = "verticale" if orientamento_label == "Verticali" else "orizzontale"
+    orientamento_label = st.radio("Orientamento linee", ["Verticali", "Orizzontali", "Verticali + Orizzontali"],
+                                   horizontal=True)
+    ORIENTAMENTI = {"Verticali": "verticale", "Orizzontali": "orizzontale",
+                     "Verticali + Orizzontali": "misto"}
+    orientamento = ORIENTAMENTI[orientamento_label]
+    if orientamento == "misto":
+        st.caption("In modalità mista: bassi verticali (sostenuti), alti orizzontali (rapidi), "
+                   "medi alternati nel tempo.")
     num_lanes = st.slider("Numero di linee", 1, 24, 10)
     palette = st.selectbox("Palette colore", list(PALETTES.keys()))
+
+    band_colors = None
+    if palette == "Per banda (bassi/medi/alti)":
+        st.caption("Un colore per ciascuna banda di frequenza (solo eventi audio; "
+                   "le altre fonti restano grigio chiaro).")
+        c_bassi = st.color_picker("Bassi", "#EB2828")
+        c_medi = st.color_picker("Medi", "#FFAA00")
+        c_alti = st.color_picker("Alti", "#00C8FF")
+
+        def _hex_to_rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+        band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
+                        "treble": _hex_to_rgb(c_alti)}
 
     st.markdown("---")
     show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
@@ -650,7 +697,8 @@ if st.button("🚀 GENERA", use_container_width=True):
 
         def make_frame(t):
             return render_frame(t, score, width=export_w, height=export_h,
-                                 orientation=orientamento, num_lanes=num_lanes, palette=palette)
+                                 orientation=orientamento, num_lanes=num_lanes,
+                                 palette=palette, band_colors=band_colors)
 
         clip = VideoClip(make_frame, duration=score["duration"])
         clip = clip.with_fps(FPS) if hasattr(clip, "with_fps") else clip.set_fps(FPS)
