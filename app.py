@@ -17,6 +17,25 @@ SOURCE_COLOR = {
     "video": (0, 210, 255),     # ciano
 }
 
+# Palette selezionabili dall'utente: se diversa da "Multicolore" sostituisce
+# la colorazione per fonte con variazioni di luminosità di un unico colore.
+PALETTES = {
+    "Multicolore (per fonte)": None,
+    "Rosso":   (235, 40, 40),
+    "Blu":     (60, 140, 255),
+    "Bianco":  (240, 240, 240),
+    "Ambra":   (255, 170, 0),
+    "Verde":   (60, 220, 120),
+}
+
+
+def get_event_color(e, palette_name):
+    base = PALETTES.get(palette_name)
+    if base is None:  # multicolore per fonte
+        base = SOURCE_COLOR.get(e["source"], (255, 255, 255))
+    factor = 0.45 + 0.55 * e.get("vel", 0.6)  # più intenso = più luminoso
+    return tuple(min(255, int(c * factor)) for c in base)
+
 # ============================================================
 # 1. GENERATORI PROCEDURALI (usati come default / fallback)
 # ============================================================
@@ -144,13 +163,29 @@ def _dominant_band(y_window, sr):
     return max(energies, key=energies.get)
 
 
+def _pan_of_window(l_window, r_window):
+    """Bilanciamento stereo -1 (tutto a sinistra) .. +1 (tutto a destra)."""
+    l_energy = float(np.sum(np.abs(l_window)))
+    r_energy = float(np.sum(np.abs(r_window)))
+    total = l_energy + r_energy
+    if total < 1e-9:
+        return 0.0
+    return float(np.clip((r_energy - l_energy) / total, -1.0, 1.0))
+
+
 def extract_from_audio(audio_path):
     import librosa
-    y, sr = librosa.load(audio_path, sr=SR, mono=True)
-    duration = len(y) / sr
-    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, backtrack=True)
+    y_raw, sr = librosa.load(audio_path, sr=SR, mono=False)
+    if y_raw.ndim == 1:
+        y_stereo = np.stack([y_raw, y_raw])  # mono duplicato: pan sempre 0 (centro)
+    else:
+        y_stereo = y_raw[:2]
+    y_mono = y_stereo.mean(axis=0)
+    duration = y_mono.shape[0] / sr
+
+    onset_frames = librosa.onset.onset_detect(y=y_mono, sr=sr, backtrack=True)
     onset_times = librosa.frames_to_time(onset_frames, sr=sr)
-    rms = librosa.feature.rms(y=y)[0]
+    rms = librosa.feature.rms(y=y_mono)[0]
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
 
     win = 2048
@@ -160,17 +195,19 @@ def extract_from_audio(audio_path):
         vel = float(min(1.0, rms[idx] / (rms.max() + 1e-9)))
 
         sample_pos = int(ot * sr)
-        window = y[max(0, sample_pos - win // 2): sample_pos + win // 2]
-        band = _dominant_band(window, sr)
+        lo, hi = max(0, sample_pos - win // 2), sample_pos + win // 2
+        window_mono = y_mono[lo:hi]
+        band = _dominant_band(window_mono, sr)
         bp = BAND_PARAMS[band]
+        pan = _pan_of_window(y_stereo[0, lo:hi], y_stereo[1, lo:hi])
 
         events.append({
             "t": float(ot), "dur": bp["dur"], "pitch": bp["pitch"] + int(vel * 8),
-            "vel": vel, "source": "audio", "band": band,
+            "vel": vel, "source": "audio", "band": band, "pan": pan,
         })
 
     env = rms / (rms.max() + 1e-9)
-    return events, env, duration, y
+    return events, env, duration, y_stereo
 
 
 def extract_from_video(video_path):
@@ -267,31 +304,66 @@ def build_score(duration, seed, rule=30,
 # 4. GENERATORE VISIVO
 # ============================================================
 
-def render_frame(t, score, width=960, height=540):
+def _lane_fraction(e):
+    """Posizione 0..1 lungo l'asse delle corsie: usa il pan stereo reale se disponibile
+    (eventi audio), altrimenti il pitch come proxy deterministico per le altre fonti."""
+    if "pan" in e:
+        return (e["pan"] + 1.0) / 2.0  # da -1..1 a 0..1
+    return (e["pitch"] % 96) / 96.0
+
+
+def render_frame(t, score, width=960, height=540, orientation="verticale",
+                  num_lanes=10, palette="Multicolore (per fonte)"):
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     res = len(score["macro_envelope"])
     env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
     macro_v = float(score["macro_envelope"][env_idx])
 
-    # griglia sottile di fondo — rigore/struttura sempre visibile
+    # griglia sottile di fondo, orientata come le corsie — rigore sempre visibile
     grid_alpha = int(12 + macro_v * 18)
-    grid_step = max(20, width // 24)
-    for gx in range(0, width, grid_step):
-        frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
+    if orientation == "verticale":
+        grid_step = max(8, width // 24)
+        for gx in range(0, width, grid_step):
+            frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
+    else:
+        grid_step = max(8, height // 24)
+        for gy in range(0, height, grid_step):
+            frame[gy, :] = (grid_alpha, grid_alpha, grid_alpha)
 
     active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    num_lanes = max(1, int(num_lanes))
+
     for e in active:
-        x = int((e["pitch"] % 96) / 96 * (width - 10))
         prog = (t - e["t"]) / max(e["dur"], 0.05)
-        h = int(height * (0.15 + 0.8 * e["vel"]) * (1 - prog * 0.3))
-        color = SOURCE_COLOR.get(e["source"], (255, 255, 255))
-        if "band" in e:
-            thickness = BAND_PARAMS[e["band"]]["thickness"]
-        else:
-            thickness = 1.0 if e["source"] == "ca" else 1.6
-        bar_w = max(2, int(6 * (0.5 + macro_v) * thickness))
-        y0 = height // 2 - h // 2
-        cv2.rectangle(frame, (x, y0), (x + bar_w, y0 + max(h, 2)), color, -1)
+        color = get_event_color(e, palette)
+
+        band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
+            (1.0 if e["source"] == "ca" else 1.6)
+        # lo spessore ora riflette SIA la banda SIA l'intensità del colpo (il "beat")
+        intensity_factor = 0.5 + 0.9 * e["vel"]
+        thickness_factor = band_thickness * intensity_factor
+
+        lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
+        lane_idx = int(lane_frac * num_lanes)
+
+        extent_frac = (0.2 + 0.75 * e["vel"]) * (1 - prog * 0.3)  # lunghezza della barra
+
+        if orientation == "verticale":
+            lane_w = width / num_lanes
+            x_center = lane_idx * lane_w + lane_w / 2
+            bar_w = int(np.clip(lane_w * 0.55 * thickness_factor, 3, lane_w * 0.95))
+            bar_len = int(height * extent_frac)
+            y0 = height // 2 - bar_len // 2
+            x0 = int(x_center - bar_w / 2)
+            cv2.rectangle(frame, (x0, y0), (x0 + bar_w, y0 + max(bar_len, 2)), color, -1)
+        else:  # orizzontale
+            lane_h = height / num_lanes
+            y_center = lane_idx * lane_h + lane_h / 2
+            bar_h = int(np.clip(lane_h * 0.55 * thickness_factor, 3, lane_h * 0.95))
+            bar_len = int(width * extent_frac)
+            x0 = width // 2 - bar_len // 2
+            y0 = int(y_center - bar_h / 2)
+            cv2.rectangle(frame, (x0, y0), (x0 + max(bar_len, 2), y0 + bar_h), color, -1)
 
     return frame
 
@@ -303,20 +375,23 @@ def render_frame(t, score, width=960, height=540):
 def synthesize_audio(score, sr=SR):
     duration = max(score["duration"], 0.1)
     N = int(duration * sr)
-    out = np.zeros(N)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
     t_ax = np.linspace(0, duration, N)
 
     env_full = np.interp(t_ax, np.linspace(0, duration, len(score["macro_envelope"])), score["macro_envelope"])
     tex_full = np.interp(t_ax, np.linspace(0, duration, len(score["micro_texture"])), score["micro_texture"])
 
-    # drone macro — frequenza istantanea integrata correttamente (fase continua)
+    # drone macro — frequenza istantanea integrata correttamente (fase continua), centrato
     base_freq = 55.0
     drone_freq = base_freq * (1 + tex_full * 0.5)
     phase = 2 * np.pi * np.cumsum(drone_freq) / sr
     drone = np.sin(phase) * (0.06 + 0.10 * env_full)
-    out += drone
+    out_l += drone
+    out_r += drone
 
-    # eventi discreti — ogni fonte ha lo stesso motore di sintesi (stessa "grammatica")
+    # eventi discreti — ogni fonte ha lo stesso motore di sintesi (stessa "grammatica"),
+    # posizionati in stereo secondo il pan reale (0.0 = centro, per fonti senza pan noto)
     for e in score["events"]:
         start = int(e["t"] * sr)
         dur_n = max(int(0.03 * sr), int(e["dur"] * sr))
@@ -328,19 +403,34 @@ def synthesize_audio(score, sr=SR):
         seg_t = np.arange(seg_len) / sr
         wave = np.sin(2 * np.pi * freq * seg_t) * e["vel"]
         env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
-        out[start:end] += wave * env_local * 0.45
+        signal = wave * env_local * 0.45
 
-    out = np.clip(out, -1.0, 1.0)
-    return np.tile(out, (2, 1))
+        pan = e.get("pan", 0.0)
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
 
 
 def fit_audio_length(y, N):
-    """Adatta un array audio mono alla lunghezza N (trim o loop), come nelle altre app della suite."""
-    if len(y) == 0:
-        return np.zeros(N)
-    if len(y) >= N:
-        return y[:N]
-    return np.tile(y, int(np.ceil(N / len(y))))[:N]
+    """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
+    if y.ndim == 1:
+        if len(y) == 0:
+            return np.zeros(N)
+        if len(y) >= N:
+            return y[:N]
+        return np.tile(y, int(np.ceil(N / len(y))))[:N]
+    else:
+        length = y.shape[1]
+        if length == 0:
+            return np.zeros((y.shape[0], N))
+        if length >= N:
+            return y[:, :N]
+        reps = int(np.ceil(N / length))
+        return np.tile(y, (1, reps))[:, :N]
 
 
 def generate_text_report(params, score, brand="Loop507", vol=None):
@@ -453,7 +543,15 @@ with st.sidebar:
     export_w, export_h = EXPORT_SIZES[formato_export]
 
     st.markdown("---")
-    show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True)
+    st.header("🎨 Aspetto visivo")
+    orientamento_label = st.radio("Orientamento linee", ["Verticali", "Orizzontali"], horizontal=True)
+    orientamento = "verticale" if orientamento_label == "Verticali" else "orizzontale"
+    num_lanes = st.slider("Numero di linee", 1, 24, 10)
+    palette = st.selectbox("Palette colore", list(PALETTES.keys()))
+
+    st.markdown("---")
+    show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
+                                      disabled=(palette != "Multicolore (per fonte)"))
 
 # ------------------------------------------------------------
 # ESTRAZIONE — ogni input presente alimenta un ruolo diverso
@@ -494,7 +592,7 @@ duration = max(durations) if durations else float(manual_duration)
 st.write(f"**Durata risultante:** {duration:.1f}s "
          f"({'da input caricati' if durations else 'da slider, nessun input caricato'})")
 
-if show_source_legend:
+if show_source_legend and palette == "Multicolore (per fonte)":
     legend_cols = st.columns(4)
     labels = {"ca": "Procedurale (automa cellulare)", "midi": "MIDI",
               "audio": "Audio", "video": "Video"}
@@ -537,11 +635,9 @@ if st.button("🚀 GENERA", use_container_width=True):
         generated = synthesize_audio(score, sr=SR)  # shape (2, N)
 
         if audio_mode == "Originale (file caricato)" and audio_raw is not None:
-            fitted = fit_audio_length(audio_raw, N)
-            final_audio = np.tile(fitted, (2, 1))
+            final_audio = fit_audio_length(audio_raw, N)
         elif audio_mode == "Mix (generata + originale)" and audio_raw is not None:
-            fitted = fit_audio_length(audio_raw, N)
-            original_stereo = np.tile(fitted, (2, 1))
+            original_stereo = fit_audio_length(audio_raw, N)
             final_audio = np.clip(generated * 0.6 + original_stereo * 0.6, -1.0, 1.0)
         else:
             final_audio = generated
@@ -553,7 +649,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         st.write(f"Rendering fotogrammi a {export_w}x{export_h} (può richiedere qualche minuto)...")
 
         def make_frame(t):
-            return render_frame(t, score, width=export_w, height=export_h)
+            return render_frame(t, score, width=export_w, height=export_h,
+                                 orientation=orientamento, num_lanes=num_lanes, palette=palette)
 
         clip = VideoClip(make_frame, duration=score["duration"])
         clip = clip.with_fps(FPS) if hasattr(clip, "with_fps") else clip.set_fps(FPS)
