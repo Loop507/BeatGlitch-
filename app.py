@@ -263,6 +263,7 @@ def synthesize_audio(score, sr=SR):
     return np.tile(out, (2, 1))
 
 
+import os, json, tempfile
 import streamlit as st
 try:
     from moviepy.editor import VideoClip, AudioFileClip  # moviepy 1.x
