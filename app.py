@@ -1,7 +1,8 @@
 """
-IKEDA ENGINE — motore generativo audio/video "alla Ikeda"
-Genera una PARTITURA astratta (procedurale e/o da MIDI/audio/video esterni)
-e la trasforma sia in geometria visiva sia in sintesi sonora, dallo stesso dato.
+PARTITURA — motore generativo audio/video procedurale (Loop507)
+Genera una struttura dati astratta (la "partitura", procedurale e/o alimentata
+da MIDI/audio/video esterni) e la trasforma sia in geometria visiva sia in
+sintesi sonora, dallo stesso dato condiviso.
 """
 import numpy as np
 import cv2
@@ -131,7 +132,7 @@ def extract_from_audio(audio_path):
         events.append({"t": float(ot), "dur": 0.15, "pitch": 60, "vel": vel, "source": "audio"})
 
     env = rms / (rms.max() + 1e-9)
-    return events, env, duration
+    return events, env, duration, y
 
 
 def extract_from_video(video_path):
@@ -209,7 +210,8 @@ def render_frame(t, score, width=960, height=540):
 
     # griglia sottile di fondo — rigore/struttura sempre visibile
     grid_alpha = int(12 + macro_v * 18)
-    for gx in range(0, width, 40):
+    grid_step = max(20, width // 24)
+    for gx in range(0, width, grid_step):
         frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
 
     active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
@@ -263,7 +265,112 @@ def synthesize_audio(score, sr=SR):
     return np.tile(out, (2, 1))
 
 
+def fit_audio_length(y, N):
+    """Adatta un array audio mono alla lunghezza N (trim o loop), come nelle altre app della suite."""
+    if len(y) == 0:
+        return np.zeros(N)
+    if len(y) >= N:
+        return y[:N]
+    return np.tile(y, int(np.ceil(N / len(y))))[:N]
+
+
+def generate_pdf_report(out_path, params, score, brand="Loop507"):
+    """Report tecnico in stile Loop507 (sfondo scuro, dati essenziali sull'opera generata)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas as pdf_canvas
+    from reportlab.lib.units import mm
+
+    W, H = A4
+    c = pdf_canvas.Canvas(out_path, pagesize=A4)
+
+    # sfondo scuro
+    c.setFillColorRGB(0.05, 0.05, 0.05)
+    c.rect(0, 0, W, H, fill=1, stroke=0)
+
+    margin = 20 * mm
+    y_cur = H - margin
+
+    c.setFillColorRGB(0.95, 0.95, 0.95)
+    c.setFont("Courier-Bold", 20)
+    c.drawString(margin, y_cur, f":: PARTITURA — {brand}")
+    y_cur -= 10 * mm
+
+    c.setFont("Courier", 9)
+    c.setFillColorRGB(0.6, 0.6, 0.6)
+    c.drawString(margin, y_cur, f"Report tecnico generato il {params['timestamp']}")
+    y_cur -= 12 * mm
+
+    c.setStrokeColorRGB(0.3, 0.3, 0.3)
+    c.line(margin, y_cur, W - margin, y_cur)
+    y_cur -= 10 * mm
+
+    c.setFillColorRGB(0.9, 0.9, 0.9)
+    c.setFont("Courier-Bold", 12)
+    c.drawString(margin, y_cur, "PARAMETRI GENERATIVI")
+    y_cur -= 8 * mm
+
+    c.setFont("Courier", 10)
+    righe = [
+        f"Seed:              {params['seed']}",
+        f"Regola automa:     {params['rule']}",
+        f"Durata:            {params['duration']:.1f}s",
+        f"Risoluzione:       {params['resolution']}",
+        f"Colonna sonora:    {params['audio_mode']}",
+        f"Eventi totali:     {len(score['events'])}",
+    ]
+    for r in righe:
+        c.drawString(margin, y_cur, r)
+        y_cur -= 6.5 * mm
+
+    y_cur -= 6 * mm
+    c.setFont("Courier-Bold", 12)
+    c.drawString(margin, y_cur, "FONTI DEGLI EVENTI")
+    y_cur -= 9 * mm
+
+    counts = {}
+    for e in score["events"]:
+        counts[e["source"]] = counts.get(e["source"], 0) + 1
+
+    labels = {"ca": "Procedurale (automa cellulare)", "midi": "MIDI",
+              "audio": "Audio", "video": "Video"}
+    c.setFont("Courier", 10)
+    for key, label in labels.items():
+        n = counts.get(key, 0)
+        r, g, b = SOURCE_COLOR[key]
+        c.setFillColorRGB(r / 255, g / 255, b / 255)
+        c.rect(margin, y_cur - 3, 4 * mm, 4 * mm, fill=1, stroke=0)
+        c.setFillColorRGB(0.85, 0.85, 0.85)
+        c.drawString(margin + 7 * mm, y_cur, f"{label}: {n} eventi")
+        y_cur -= 7 * mm
+
+    y_cur -= 8 * mm
+    c.setStrokeColorRGB(0.3, 0.3, 0.3)
+    c.line(margin, y_cur, W - margin, y_cur)
+    y_cur -= 10 * mm
+
+    c.setFont("Courier-Bold", 12)
+    c.setFillColorRGB(0.9, 0.9, 0.9)
+    c.drawString(margin, y_cur, "CONCETTO")
+    y_cur -= 8 * mm
+    c.setFont("Courier", 9)
+    c.setFillColorRGB(0.75, 0.75, 0.75)
+    testo = [
+        "Un'unica struttura dati astratta (la partitura) genera contemporaneamente",
+        "la parte visiva e quella sonora dell'opera. Le fonti esterne opzionali",
+        "(MIDI, audio, video) alimentano ruoli specifici della partitura senza",
+        "sostituire il motore procedurale di base, che resta sempre attivo.",
+    ]
+    for riga in testo:
+        c.drawString(margin, y_cur, riga)
+        y_cur -= 5.5 * mm
+
+    c.showPage()
+    c.save()
+
+
+
 import os, json, tempfile
+from datetime import datetime
 import streamlit as st
 try:
     from moviepy.editor import VideoClip, AudioFileClip  # moviepy 1.x
@@ -271,9 +378,9 @@ except ModuleNotFoundError:
     from moviepy import VideoClip, AudioFileClip  # moviepy 2.x
 import soundfile as sf
 
-st.set_page_config(page_title="Ikeda Engine — Loop507", layout="wide")
-st.title("◧ IKEDA ENGINE")
-st.caption("Generazione audio-video procedurale da una partitura condivisa. "
+st.set_page_config(page_title="Partitura — Loop507", layout="wide")
+st.title("◧ PARTITURA")
+st.caption("Generazione audio-video procedurale da una struttura dati condivisa. "
            "MIDI, audio e video sono opzionali: senza input, il sistema genera da sé.")
 
 # ------------------------------------------------------------
@@ -293,12 +400,25 @@ with st.sidebar:
     manual_duration = st.slider("Durata (se nessun input caricato)", 5, 60, 15)
 
     st.markdown("---")
+    st.header("📐 Formato export")
+    formato_export = st.selectbox("Dimensioni video", [
+        "1280x720 (16:9)", "720x1280 (9:16)", "720x720 (1:1)"
+    ])
+    EXPORT_SIZES = {
+        "1280x720 (16:9)": (1280, 720),
+        "720x1280 (9:16)": (720, 1280),
+        "720x720 (1:1)": (720, 720),
+    }
+    export_w, export_h = EXPORT_SIZES[formato_export]
+
+    st.markdown("---")
     show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True)
 
 # ------------------------------------------------------------
 # ESTRAZIONE — ogni input presente alimenta un ruolo diverso
 # ------------------------------------------------------------
 midi_events, audio_events, audio_env, video_events, video_env = None, None, None, None, None
+audio_raw = None
 durations = []
 
 def save_upload(f, suffix):
@@ -317,7 +437,7 @@ if midi_file:
 if audio_file:
     with st.spinner("Estrazione onset/energia da audio..."):
         audio_path = save_upload(audio_file, os.path.splitext(audio_file.name)[1])
-        audio_events, audio_env, audio_dur = extract_from_audio(audio_path)
+        audio_events, audio_env, audio_dur, audio_raw = extract_from_audio(audio_path)
         durations.append(audio_dur)
         st.sidebar.success(f"Audio: {len(audio_events)} onset rilevati")
 
@@ -347,6 +467,14 @@ if show_source_legend:
         )
 
 # ------------------------------------------------------------
+# COLONNA SONORA FINALE
+# ------------------------------------------------------------
+audio_mode_options = ["Generata (sintesi)"]
+if audio_raw is not None:
+    audio_mode_options += ["Originale (file caricato)", "Mix (generata + originale)"]
+audio_mode = st.radio("🎧 Colonna sonora finale", audio_mode_options, horizontal=True)
+
+# ------------------------------------------------------------
 # GENERAZIONE
 # ------------------------------------------------------------
 if st.button("🚀 GENERA", use_container_width=True):
@@ -360,16 +488,28 @@ if st.button("🚀 GENERA", use_container_width=True):
         )
         st.write(f"Partitura pronta — {len(score['events'])} eventi totali.")
 
-        st.write("Sintesi audio...")
-        audio_data = synthesize_audio(score, sr=SR)
+        st.write("Costruzione colonna sonora finale...")
+        N = int(score["duration"] * SR)
+        generated = synthesize_audio(score, sr=SR)  # shape (2, N)
+
+        if audio_mode == "Originale (file caricato)" and audio_raw is not None:
+            fitted = fit_audio_length(audio_raw, N)
+            final_audio = np.tile(fitted, (2, 1))
+        elif audio_mode == "Mix (generata + originale)" and audio_raw is not None:
+            fitted = fit_audio_length(audio_raw, N)
+            original_stereo = np.tile(fitted, (2, 1))
+            final_audio = np.clip(generated * 0.6 + original_stereo * 0.6, -1.0, 1.0)
+        else:
+            final_audio = generated
+
         t_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        sf.write(t_wav.name, audio_data.T, SR)
+        sf.write(t_wav.name, final_audio.T, SR)
         t_wav.close()
 
-        st.write("Rendering fotogrammi (può richiedere qualche minuto)...")
+        st.write(f"Rendering fotogrammi a {export_w}x{export_h} (può richiedere qualche minuto)...")
 
         def make_frame(t):
-            return render_frame(t, score)
+            return render_frame(t, score, width=export_w, height=export_h)
 
         clip = VideoClip(make_frame, duration=score["duration"])
         clip = clip.with_fps(FPS) if hasattr(clip, "with_fps") else clip.set_fps(FPS)
@@ -380,17 +520,33 @@ if st.button("🚀 GENERA", use_container_width=True):
         clip.write_videofile(out_path, codec="libx264", audio_codec="aac",
                               fps=FPS, logger=None)
 
+        st.write("Generazione report PDF...")
+        report_params = {
+            "seed": int(seed), "rule": rule, "duration": score["duration"],
+            "resolution": f"{export_w}x{export_h}", "audio_mode": audio_mode,
+            "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        }
+        pdf_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+        generate_pdf_report(pdf_path, report_params, score)
+
         status.update(label="Fatto!", state="complete")
 
     st.video(out_path)
+    col_dl1, col_dl2 = st.columns(2)
     with open(out_path, "rb") as f:
-        st.download_button("💾 Scarica video", f, file_name="ikeda_output.mp4")
+        col_dl1.download_button("💾 Scarica video", f, file_name="partitura_output.mp4",
+                                 use_container_width=True)
+    with open(pdf_path, "rb") as f:
+        col_dl2.download_button("📄 Scarica report PDF", f, file_name="partitura_report.pdf",
+                                 use_container_width=True)
 
     preset_export = {
         "seed": int(seed), "rule": rule, "duration": score["duration"],
         "n_events": len(score["events"]),
         "sources_used": sorted(set(e["source"] for e in score["events"])),
+        "risoluzione": f"{export_w}x{export_h}",
+        "colonna_sonora": audio_mode,
     }
     st.sidebar.download_button("💾 Esporta partitura (info)",
                                 json.dumps(preset_export, indent=2),
-                                "ikeda_score_info.json")
+                                "partitura_score_info.json")
