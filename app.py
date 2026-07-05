@@ -110,25 +110,6 @@ def macro_block_value(macro_blocks, t):
     return float(macro_blocks["values"][idx])
 
 
-def generate_macro_grid(duration, seed, cols=4, rows=3, block_seconds=3.0):
-    """Mosaico di blocchi macro indipendenti (Henke): non una singola striscia, ma una
-    griglia di grandi zone geometriche. Ogni cella ha la propria sequenza a gradini e
-    uno sfasamento temporale diverso, così i blocchi non scattano tutti insieme —
-    creano una composizione che si ricompone a pezzi nel tempo, non un unico respiro."""
-    n = cols * rows
-    cells = []
-    for i in range(n):
-        blocks = generate_macro_blocks(duration, seed + i * 131, block_seconds=block_seconds)
-        stagger = (i / n) * block_seconds
-        cells.append({"blocks": blocks, "stagger": stagger})
-    return {"cols": cols, "rows": rows, "cells": cells, "block_seconds": block_seconds}
-
-
-def macro_grid_cell_value(macro_grid, cell_index, t):
-    cell = macro_grid["cells"][cell_index]
-    return macro_block_value(cell["blocks"], t + cell["stagger"])
-
-
 def cellular_automaton(rule, width, steps, seed):
     rng = np.random.RandomState(seed)
     row = rng.randint(0, 2, width)
@@ -240,6 +221,23 @@ def _pan_of_window(l_window, r_window):
     return float(np.clip((r_energy - l_energy) / total, -1.0, 1.0))
 
 
+def _band_envelopes_over_time(y_mono, sr, n_fft=2048, hop_length=512):
+    """Inviluppo di energia continuo per bassi/medi/alti nel tempo (non per singolo
+    onset) — usato per far ricomporre il mosaico Henke in base al contenuto reale."""
+    import librosa
+    stft = np.abs(librosa.stft(y_mono, n_fft=n_fft, hop_length=hop_length))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    times = librosa.frames_to_time(np.arange(stft.shape[1]), sr=sr, hop_length=hop_length)
+
+    def norm(x):
+        return x / (x.max() + 1e-9)
+
+    bass = norm(stft[(freqs >= 20) & (freqs < 250)].sum(axis=0))
+    mid = norm(stft[(freqs >= 250) & (freqs < 2000)].sum(axis=0))
+    treble = norm(stft[(freqs >= 2000) & (freqs < 8000)].sum(axis=0))
+    return {"bass": bass, "mid": mid, "treble": treble, "times": times}
+
+
 def extract_from_audio(audio_path):
     import librosa
     y_raw, sr = librosa.load(audio_path, sr=SR, mono=False)
@@ -254,6 +252,7 @@ def extract_from_audio(audio_path):
     onset_times = librosa.frames_to_time(onset_frames, sr=sr)
     rms = librosa.feature.rms(y=y_mono)[0]
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
+    band_envelopes = _band_envelopes_over_time(y_mono, sr)
 
     win = 2048
     events = []
@@ -274,7 +273,7 @@ def extract_from_audio(audio_path):
         })
 
     env = rms / (rms.max() + 1e-9)
-    return events, env, duration, y_stereo
+    return events, env, duration, y_stereo, band_envelopes
 
 
 def extract_from_video(video_path):
@@ -325,7 +324,7 @@ def _content_seed_offset(audio_env, video_env, midi_events):
 def build_score(duration, seed, rule=30,
                  midi_events=None,
                  audio_events=None, audio_env=None,
-                 video_events=None, video_env=None,
+                 video_events=None, video_env=None, audio_band_envelopes=None,
                  resolution=200, macro_block_seconds=3.0):
     has_external = bool(midi_events or audio_events or video_events)
 
@@ -336,7 +335,25 @@ def build_score(duration, seed, rule=30,
 
     macro = generate_macro_envelope_procedural(duration, effective_seed, resolution)
     macro_blocks = generate_macro_blocks(duration, effective_seed, block_seconds=macro_block_seconds)
-    macro_grid = generate_macro_grid(duration, effective_seed, block_seconds=macro_block_seconds)
+
+    # mosaico per banda (modulo Henke): se c'è audio reale, i blocchi bassi/medi/alti
+    # riflettono l'energia VERA di quella banda in quel segmento — non rumore casuale.
+    # Senza audio, tre sequenze procedurali indipendenti fanno da sostituto plausibile.
+    if audio_band_envelopes is not None:
+        band_mosaic = {
+            "mode": "audio", "block_seconds": macro_block_seconds,
+            "bass": {"env": audio_band_envelopes["bass"], "times": audio_band_envelopes["times"]},
+            "mid": {"env": audio_band_envelopes["mid"], "times": audio_band_envelopes["times"]},
+            "treble": {"env": audio_band_envelopes["treble"], "times": audio_band_envelopes["times"]},
+        }
+    else:
+        band_mosaic = {
+            "mode": "procedural", "block_seconds": macro_block_seconds,
+            "bass": {"blocks": generate_macro_blocks(duration, effective_seed + 301, macro_block_seconds)},
+            "mid": {"blocks": generate_macro_blocks(duration, effective_seed + 302, macro_block_seconds)},
+            "treble": {"blocks": generate_macro_blocks(duration, effective_seed + 303, macro_block_seconds)},
+        }
+
     external_envs = [e for e in (audio_env, video_env) if e is not None and len(e) > 1]
     silence_envelope = None  # se presente, pilota il "gate silenzio" nel rendering
     if external_envs:
@@ -345,8 +362,18 @@ def build_score(duration, seed, rule=30,
             for e in external_envs
         ]
         combined_ext = np.mean(resampled, axis=0)
-        silence_envelope = combined_ext  # inviluppo reale, non mescolato col rumore procedurale
         macro = 0.4 * macro + 0.6 * combined_ext  # gli esterni pesano di più se presenti
+
+        # il gate silenzio usa una risoluzione FINE dedicata (indipendente dai 200 punti
+        # della matrice): a 200 punti su un brano di 3 minuti ogni campione vale ~0.9s,
+        # che si traduce in un ritardo percepibile quando il suono riprende dopo una
+        # pausa. Qui usiamo almeno 20 campioni al secondo (~50ms), impercettibile.
+        gate_resolution = max(resolution, int(duration * 20))
+        gate_resampled = [
+            np.interp(np.linspace(0, 1, gate_resolution), np.linspace(0, 1, len(e)), e)
+            for e in external_envs
+        ]
+        silence_envelope = np.mean(gate_resampled, axis=0)
 
     # quando ci sono fonti esterne, la texture procedurale fa da "base" più leggera,
     # modulata nel tempo dalla stessa dinamica del brano/video (non più costante fissa)
@@ -366,7 +393,7 @@ def build_score(duration, seed, rule=30,
         "duration": duration,
         "seed": effective_seed,
         "macro_blocks": macro_blocks,
-        "macro_grid": macro_grid,
+        "band_mosaic": band_mosaic,
         "events": events,
         "macro_envelope": macro,
         "silence_envelope": silence_envelope,
@@ -397,14 +424,6 @@ def _event_orientation(e, mode):
     if band == "treble":
         return "orizzontale"
     return "verticale" if int(e["t"] * 10) % 2 == 0 else "orizzontale"
-
-
-def _event_grain_offsets(e, n_grains=7):
-    """Offset relativi (-1..1) deterministici per i grani di un evento — stessa
-    disposizione per tutta la durata dell'evento, non ridisegnata a caso ogni frame."""
-    seed = int((e["t"] * 1000) % 100000)
-    rng = np.random.RandomState(seed)
-    return rng.uniform(-1.0, 1.0, (n_grains, 2))
 
 
 def render_frame_ikeda(t, score, width=960, height=540, orientation="verticale",
@@ -475,6 +494,24 @@ def render_frame_ikeda(t, score, width=960, height=540, orientation="verticale",
     return frame
 
 
+def _band_block_value(band_data, mode, block_seconds, t):
+    """Valore 0..1 del blocco corrente per una banda: media dell'energia reale
+    dell'audio in quel segmento (modo 'audio'), o sequenza procedurale di fallback."""
+    t = max(0.0, t)
+    if mode == "audio":
+        env, times = band_data["env"], band_data["times"]
+        if len(env) == 0:
+            return 0.0
+        block_start = (t // block_seconds) * block_seconds
+        block_end = block_start + block_seconds
+        mask = (times >= block_start) & (times < block_end)
+        if not np.any(mask):
+            idx = min(len(env) - 1, int(np.searchsorted(times, t)))
+            return float(env[idx])
+        return float(env[mask].mean())
+    return macro_block_value(band_data["blocks"], t)
+
+
 def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
                         num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
     frame = np.zeros((height, width, 3), dtype=np.uint8)
@@ -482,89 +519,36 @@ def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
     env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
     macro_v = float(score["macro_envelope"][env_idx])
 
-    # griglia sottile di fondo — in modalità mista mostra entrambi gli assi
     grid_alpha = int(12 + macro_v * 18)
-    if orientation in ("verticale", "misto"):
-        grid_step = max(8, width // 24)
-        for gx in range(0, width, grid_step):
-            frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
-    if orientation in ("orizzontale", "misto"):
-        grid_step = max(8, height // 24)
-        for gy in range(0, height, grid_step):
-            frame[gy, :] = (grid_alpha, grid_alpha, grid_alpha)
+    grid_step = max(8, width // 24)
+    for gx in range(0, width, grid_step):
+        frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
 
-    # STRATO MACRO (Henke): un MOSAICO di grandi blocchi geometrici, non una singola
-    # striscia — ogni cella ha il proprio ritmo di cambio (scaglionato), così la
-    # composizione si ricompone a pezzi nel tempo. Resta visibile ANCHE durante il
-    # silenzio: è la struttura sostenuta, non la reazione istantanea al singolo colpo.
-    grid = score["macro_grid"]
-    cols, rows = grid["cols"], grid["rows"]
-    cell_w, cell_h = width / cols, height / rows
+    # MOSAICO (Henke): 3 righe — alti/medi/bassi dall'alto in basso — 4 celle ciascuna.
+    # Ogni cella nella riga legge la STESSA banda ma in un istante leggermente
+    # sfasato (effetto "eco a cascata"): non rumore casuale, energia reale della
+    # banda, letta con un piccolo ritardo diverso per ogni colonna.
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+    bc = band_colors or DEFAULT_BAND_COLORS
+    rows_bands = ["treble", "mid", "bass"]
+    cols = 4
+    cell_w, cell_h = width / cols, height / len(rows_bands)
 
-    # tinta di base: neutra (grigio) se palette multicolore, altrimenti versione
-    # smorzata del colore scelto — coerente col resto ma sempre più tenue dei grani
-    palette_base = PALETTES.get(palette)
-    base_tint = palette_base if isinstance(palette_base, tuple) else (140, 140, 150)
-
-    for cell_idx in range(cols * rows):
-        r, c = divmod(cell_idx, cols)
-        val = macro_grid_cell_value(grid, cell_idx, t)
-        # ogni cella riempie una frazione variabile della propria area (mai fissa):
-        # un salto di valore alto = blocco quasi pieno, basso = blocco piccolo e centrato
-        fill = 0.25 + 0.65 * val
-        bw, bh = cell_w * fill, cell_h * fill
-        cx, cy = c * cell_w + cell_w / 2, r * cell_h + cell_h / 2
-        x0, y0 = int(cx - bw / 2), int(cy - bh / 2)
-        x1, y1 = int(cx + bw / 2), int(cy + bh / 2)
-        shade = 0.25 + 0.55 * val
-        color = tuple(int(ch * shade) for ch in base_tint)
-        cv2.rectangle(frame, (x0, y0), (x1, y1), color, -1)
-
-    # gate silenzio: durante il silenzio reale lo strato MICRO non deve comparire —
-    # la macro resta comunque visibile (è la separazione netta macro/micro di Henke)
-    SILENCE_THRESHOLD = 0.06
-    gate_env = score.get("silence_envelope")
-    if gate_env is not None:
-        gate_idx = min(len(gate_env) - 1, int((t / max(score["duration"], 1e-6)) * len(gate_env)))
-        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
-            return frame  # silenzio: griglia + banda macro, ma nessun grano micro
-
-    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
-
-    for e in active:
-        prog = min(1.0, (t - e["t"]) / max(e["dur"], 0.05))
-        color = get_event_color(e, palette, band_colors)
-
-        band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
-            (1.0 if e["source"] == "ca" else 1.6)
-        intensity_factor = 0.5 + 0.9 * e["vel"]
-
-        # centro della nuvola: x dal pan/pitch (come in Ikeda), y dalla banda —
-        # bassi in basso, alti in alto, medi al centro: dà struttura senza usare barre
-        lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
-        cx = lane_frac * width
-        band = e.get("band")
-        y_bias = {"bass": 0.78, "mid": 0.5, "treble": 0.22}.get(band, 0.5)
-        cy = y_bias * height
-
-        # i grani si disperdono dal centro verso l'esterno nel tempo (sintesi
-        # granulare: un'esplosione di puntini, non una linea sostenuta)
-        spread_x = width * 0.05 * (0.3 + prog) * (0.6 + 0.6 * e["vel"])
-        spread_y = height * 0.05 * (0.3 + prog) * (0.6 + 0.6 * e["vel"])
-        if orientation == "orizzontale":
-            spread_x *= 2.2
-        elif orientation == "verticale":
-            spread_y *= 2.2
-
-        radius = max(2, int(3 * band_thickness * intensity_factor * (1 - prog * 0.4)))
-        fade = 1.0 - prog * 0.5  # i grani si affievoliscono man mano che si allontanano
-        grain_color = tuple(int(c * fade) for c in color)
-
-        for ox, oy in _event_grain_offsets(e):
-            gx = int(cx + ox * spread_x)
-            gy = int(cy + oy * spread_y)
-            if 0 <= gx < width and 0 <= gy < height:
-                cv2.circle(frame, (gx, gy), radius, grain_color, -1)
+    for r, band_name in enumerate(rows_bands):
+        band_data = mosaic[band_name]
+        for c in range(cols):
+            offset = c * (block_seconds / cols)
+            val = _band_block_value(band_data, mode, block_seconds, t - offset)
+            fill = 0.22 + 0.68 * val
+            bw, bh = cell_w * fill, cell_h * fill
+            cx, cy = c * cell_w + cell_w / 2, r * cell_h + cell_h / 2
+            x0, y0 = int(cx - bw / 2), int(cy - bh / 2)
+            x1, y1 = int(cx + bw / 2), int(cy + bh / 2)
+            shade = 0.35 + 0.65 * val
+            base_color = bc.get(band_name, (140, 140, 150))
+            color = tuple(int(ch * shade) for ch in base_color)
+            cv2.rectangle(frame, (x0, y0), (x1, y1), color, -1)
 
     return frame
 
@@ -739,10 +723,9 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
     righe.append(f"* Risoluzione: {params['resolution']}")
     righe.append(f"* Durata: {score['duration']:.1f}s")
     if module_id == "02":
-        grid = score["macro_grid"]
-        n_cells = grid["cols"] * grid["rows"]
-        righe.append(f"* Mosaico macro: {grid['cols']}x{grid['rows']} celle ({n_cells}), "
-                      f"ogni {grid['block_seconds']:.1f}s (scaglionate)")
+        mosaic = score["band_mosaic"]
+        modo_str = "energia audio reale" if mosaic["mode"] == "audio" else "procedurale (nessun audio)"
+        righe.append(f"* Mosaico: 4x3 celle (bassi/medi/alti), ogni {mosaic['block_seconds']:.1f}s, {modo_str}")
     righe.append(f"* Colonna sonora: {params['audio_mode']}")
     righe.append(f"* Eventi totali: {len(score['events'])}")
     righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
@@ -793,8 +776,8 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 render_frame_fn = render_frame_ikeda if module_id == "01" else render_frame_henke
 synthesize_audio_fn = synthesize_audio_ikeda if module_id == "01" else synthesize_audio_henke
 if module_id == "02":
-    st.caption("Modulo Henke: la banda macro (struttura a blocchi) resta visibile anche "
-               "nel silenzio — solo i grani micro reagiscono all'istante presente.")
+    st.caption("Modulo Henke: un mosaico di 12 blocchi (4 colonne × bassi/medi/alti) "
+               "si ricompone in base all'energia reale delle tre bande di frequenza.")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -826,24 +809,45 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🎨 Aspetto visivo")
-    orientamento_label = st.radio("Orientamento linee", ["Verticali", "Orizzontali", "Verticali + Orizzontali"],
-                                   horizontal=True)
-    ORIENTAMENTI = {"Verticali": "verticale", "Orizzontali": "orizzontale",
-                     "Verticali + Orizzontali": "misto"}
-    orientamento = ORIENTAMENTI[orientamento_label]
-    if orientamento == "misto":
-        st.caption("In modalità mista: bassi verticali (sostenuti), alti orizzontali (rapidi), "
-                   "medi alternati nel tempo.")
-    num_lanes = st.slider("Numero di linee", 1, 24, 10)
-    palette = st.selectbox("Palette colore", list(PALETTES.keys()))
 
-    band_colors = None
-    if palette == "Per banda (bassi/medi/alti)":
-        st.caption("Un colore per ciascuna banda di frequenza (solo eventi audio; "
-                   "le altre fonti restano grigio chiaro).")
-        c_bassi = st.color_picker("Bassi", "#EB2828")
-        c_medi = st.color_picker("Medi", "#FFAA00")
-        c_alti = st.color_picker("Alti", "#00C8FF")
+    if module_id == "01":
+        orientamento_label = st.radio("Orientamento linee", ["Verticali", "Orizzontali", "Verticali + Orizzontali"],
+                                       horizontal=True)
+        ORIENTAMENTI = {"Verticali": "verticale", "Orizzontali": "orizzontale",
+                         "Verticali + Orizzontali": "misto"}
+        orientamento = ORIENTAMENTI[orientamento_label]
+        if orientamento == "misto":
+            st.caption("In modalità mista: bassi verticali (sostenuti), alti orizzontali (rapidi), "
+                       "medi alternati nel tempo.")
+        num_lanes = st.slider("Numero di linee", 1, 24, 10)
+        palette = st.selectbox("Palette colore", list(PALETTES.keys()))
+
+        band_colors = None
+        if palette == "Per banda (bassi/medi/alti)":
+            st.caption("Un colore per ciascuna banda di frequenza (solo eventi audio; "
+                       "le altre fonti restano grigio chiaro).")
+            c_bassi = st.color_picker("Bassi", "#EB2828")
+            c_medi = st.color_picker("Medi", "#FFAA00")
+            c_alti = st.color_picker("Alti", "#00C8FF")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
+                            "treble": _hex_to_rgb(c_alti)}
+
+        st.markdown("---")
+        show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
+                                          disabled=(palette != "Multicolore (per fonte)"))
+    else:
+        # Modulo Henke: il mosaico è sempre colorato per banda — niente orientamento/
+        # linee/palette (non esistono più grani da colorare individualmente)
+        st.caption("Il mosaico si ricompone in base all'energia reale di bassi/medi/alti "
+                   "(o a sequenze procedurali se non carichi audio). Scegli i colori delle tre righe.")
+        c_bassi = st.color_picker("Bassi (riga in basso)", "#EB2828")
+        c_medi = st.color_picker("Medi (riga centrale)", "#FFAA00")
+        c_alti = st.color_picker("Alti (riga in alto)", "#00C8FF")
 
         def _hex_to_rgb(h):
             h = h.lstrip("#")
@@ -851,16 +855,15 @@ with st.sidebar:
 
         band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
                         "treble": _hex_to_rgb(c_alti)}
-
-    st.markdown("---")
-    show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
-                                      disabled=(palette != "Multicolore (per fonte)"))
+        orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
+        show_source_legend = False
 
 # ------------------------------------------------------------
 # ESTRAZIONE — ogni input presente alimenta un ruolo diverso
 # ------------------------------------------------------------
 midi_events, audio_events, audio_env, video_events, video_env = None, None, None, None, None
 audio_raw = None
+audio_band_envelopes = None
 durations = []
 
 def save_upload(f, suffix):
@@ -879,7 +882,7 @@ if midi_file:
 if audio_file:
     with st.spinner("Estrazione onset/energia da audio..."):
         audio_path = save_upload(audio_file, os.path.splitext(audio_file.name)[1])
-        audio_events, audio_env, audio_dur, audio_raw = extract_from_audio(audio_path)
+        audio_events, audio_env, audio_dur, audio_raw, audio_band_envelopes = extract_from_audio(audio_path)
         durations.append(audio_dur)
         st.sidebar.success(f"Audio: {len(audio_events)} onset rilevati")
 
@@ -930,6 +933,7 @@ if st.button("🚀 GENERA", use_container_width=True):
             midi_events=midi_events,
             audio_events=audio_events, audio_env=audio_env,
             video_events=video_events, video_env=video_env,
+            audio_band_envelopes=audio_band_envelopes,
         )
         st.write(f"Matrice pronta — {len(score['events'])} eventi totali.")
 
