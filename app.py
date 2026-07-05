@@ -30,6 +30,14 @@ MODULES = {
         "quote": "La struttura non sfuma. Cambia di scatto, mentre la grana continua a vibrare.",
         "hashtag": "#macromicron #granularsynthesis",
     },
+    "03": {
+        "nome": "Molnár — Disordine Controllato",
+        "effetto": "Grid Deviation",
+        "processo": "Griglia Rigida + Deviazioni Rare",
+        "motore_tag": "griglia + eccezioni rare",
+        "quote": "La regola resta quasi sempre uguale. Quando si rompe, lo fa apposta.",
+        "hashtag": "#griddeviation #controlleddisorder",
+    },
 }
 
 SOURCE_COLOR = {
@@ -108,6 +116,47 @@ def generate_macro_blocks(duration, seed, block_seconds=3.0):
 def macro_block_value(macro_blocks, t):
     idx = min(len(macro_blocks["values"]) - 1, int(t // macro_blocks["block_seconds"]))
     return float(macro_blocks["values"][idx])
+
+
+def generate_deviation_events(duration, seed, audio_events=None, strong_threshold=0.72,
+                               min_gap=1.0, block_seconds=3.0):
+    """Eventi di deviazione RARI (Molnár): scattano solo sui colpi audio davvero forti
+    (non su ogni battito — altrimenti non sarebbero eccezioni), con una distanza minima
+    tra un evento e il successivo. Se l'audio non basta a generarne a sufficienza (o non
+    c'è audio), un fallback procedurale sparso ne aggiunge qualcuno, sempre con parsimonia."""
+    events = []
+    if audio_events:
+        last_t = -min_gap
+        for e in sorted(audio_events, key=lambda x: x["t"]):
+            if e["vel"] >= strong_threshold and (e["t"] - last_t) >= min_gap:
+                events.append({"t": e["t"], "source": "audio", "vel": e["vel"],
+                                "band": e.get("band", "mid"), "pan": e.get("pan", 0.0)})
+                last_t = e["t"]
+
+    rng = np.random.RandomState(seed + 909)
+    n_blocks = max(1, int(np.ceil(duration / block_seconds)))
+    for i in range(n_blocks):
+        if rng.random() < 0.35:  # ~1 possibilità su 3 per blocco: resta raro
+            t_dev = i * block_seconds + rng.uniform(0.2, max(0.3, block_seconds - 0.2))
+            if t_dev >= duration:
+                continue
+            if not events or min(abs(t_dev - e["t"]) for e in events) >= min_gap * 0.5:
+                events.append({"t": float(t_dev), "source": "ca",
+                                "vel": float(rng.uniform(0.5, 1.0)), "band": None, "pan": 0.0})
+
+    events.sort(key=lambda e: e["t"])
+    return events
+
+
+DEVIATION_TYPES = ["colore", "posizione", "rotazione", "dimensione"]
+
+
+def _deviation_cell_and_type(e, n_cells):
+    seed = int((e["t"] * 1000) % 100000)
+    rng = np.random.RandomState(seed)
+    cell_idx = int(rng.randint(0, n_cells))
+    dtype = DEVIATION_TYPES[int(rng.randint(0, len(DEVIATION_TYPES)))]
+    return cell_idx, dtype
 
 
 def cellular_automaton(rule, width, steps, seed):
@@ -389,11 +438,16 @@ def build_score(duration, seed, rule=30,
 
     texture = generate_micro_texture_procedural(resolution * 4, effective_seed)
 
+    deviation_events = generate_deviation_events(
+        duration, effective_seed, audio_events=audio_events, block_seconds=macro_block_seconds
+    )
+
     return {
         "duration": duration,
         "seed": effective_seed,
         "macro_blocks": macro_blocks,
         "band_mosaic": band_mosaic,
+        "deviation_events": deviation_events,
         "events": events,
         "macro_envelope": macro,
         "silence_envelope": silence_envelope,
@@ -581,6 +635,78 @@ def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
     return frame
 
 
+def render_frame_molnar(t, score, width=960, height=540, orientation="verticale",
+                         num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                         grid_cols=10, accent_color=(235, 40, 60)):
+    """Griglia rigida (Molnár): quasi sempre perfettamente regolare. Le celle non
+    respirano, non reagiscono all'istante — restano identiche finché non arriva una
+    deviazione RARA (colore/posizione/rotazione/dimensione), sempre sulla stessa
+    griglia di partenza. Nessuna texture di sfondo: il fondo è vuoto apposta."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+
+    cols = max(3, int(grid_cols))
+    cell_size = width / cols
+    rows = max(1, int(round(height / cell_size)))
+    cell_w, cell_h = width / cols, height / rows
+    base_color = (150, 150, 150)
+    base_square = min(cell_w, cell_h) * 0.34
+
+    # griglia regolare — stessa dimensione, stesso colore, stesso orientamento ovunque
+    cell_state = {}  # cell_idx -> parametri di deviazione attivi in questo frame
+    for e in score["deviation_events"]:
+        dur = 0.45
+        if not (e["t"] <= t <= e["t"] + dur):
+            continue
+        n_cells = cols * rows
+        cell_idx, dtype = _deviation_cell_and_type(e, n_cells)
+        prog = (t - e["t"]) / dur
+        decay = 1.0 - prog
+        cell_state[cell_idx] = (dtype, decay, e)
+
+    for idx in range(cols * rows):
+        r, c = divmod(idx, cols)
+        cx, cy = c * cell_w + cell_w / 2, r * cell_h + cell_h / 2
+        half = base_square
+
+        if idx in cell_state:
+            dtype, decay, e = cell_state[idx]
+            if dtype == "colore":
+                color = tuple(int(a + (b - a) * decay) for a, b in zip(base_color, accent_color))
+                half_eff = half
+                offset = (0, 0)
+                angle = 0.0
+            elif dtype == "posizione":
+                color = base_color
+                shift = half * 2.2 * decay
+                offset = (shift, -shift * 0.6)
+                half_eff = half
+                angle = 0.0
+            elif dtype == "dimensione":
+                color = base_color
+                half_eff = half * (1.0 + 1.6 * decay)
+                offset = (0, 0)
+                angle = 0.0
+            else:  # rotazione
+                color = base_color
+                half_eff = half
+                offset = (0, 0)
+                angle = 45.0 * decay
+        else:
+            color, half_eff, offset, angle = base_color, half, (0, 0), 0.0
+
+        px, py = cx + offset[0], cy + offset[1]
+        if abs(angle) > 1.0:
+            rect = ((px, py), (half_eff * 2, half_eff * 2), angle)
+            box = cv2.boxPoints(rect).astype(int)
+            cv2.fillConvexPoly(frame, box, color)
+        else:
+            x0, y0 = int(px - half_eff), int(py - half_eff)
+            x1, y1 = int(px + half_eff), int(py + half_eff)
+            cv2.rectangle(frame, (x0, y0), (x1, y1), color, -1)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -686,6 +812,67 @@ def synthesize_audio_henke(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_molnar(score, sr=SR):
+    """Un 'orologio' ritmico fisso e prevedibile (la regola che si ripete identica),
+    con una nota fuori posto esattamente quando arriva una deviazione — stesso istante
+    del guizzo visivo, stesso principio: la regola resta uguale finché non si rompe apposta."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
+
+    seed = score["seed"]
+    rng = np.random.RandomState(seed + 505)
+    tick_interval = 0.5  # il "battito" regolare della griglia
+    scale = [0, 2, 4, 7, 9]  # pentatonica maggiore, deterministica
+    pattern = [scale[rng.randint(0, len(scale))] for _ in range(8)]  # sequenza fissa che si ripete
+
+    def note_freq(semitone_offset, base=220.0):
+        return base * (2 ** (semitone_offset / 12))
+
+    # il clock regolare — tick brevi e discreti, sempre uguali, mai reattivi all'istante
+    tick_t = 0.0
+    step = 0
+    while tick_t < duration:
+        start = int(tick_t * sr)
+        dur_n = int(0.12 * sr)
+        end = min(N, start + dur_n)
+        if end > start:
+            seg_len = end - start
+            freq = note_freq(pattern[step % len(pattern)])
+            seg_t = np.arange(seg_len) / sr
+            env_local = np.exp(-np.linspace(0, 6, seg_len))
+            wave = np.sin(2 * np.pi * freq * seg_t) * env_local * 0.18
+            out_l[start:end] += wave
+            out_r[start:end] += wave
+        tick_t += tick_interval
+        step += 1
+
+    # le deviazioni: una nota dissonante e più forte, fuori dalla scala regolare,
+    # esattamente nell'istante del guizzo visivo — sincronia totale tra vista e udito
+    for e in score["deviation_events"]:
+        start = int(e["t"] * sr)
+        dur_n = int(0.35 * sr)
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        dissonant_semitone = 1 if rng.random() < 0.5 else 6  # nota volutamente "sbagliata"
+        freq = note_freq(dissonant_semitone, base=220.0)
+        seg_t = np.arange(seg_len) / sr
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        wave = np.sin(2 * np.pi * freq * seg_t) * env_local * 0.5 * e.get("vel", 0.8)
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += wave * gain_l
+        out_r[start:end] += wave * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -728,6 +915,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("MIDI Parsing")
     if module_id == "02":
         analisi.append("Macro Block Segmentation")
+    if module_id == "03":
+        analisi.append("Grid Deviation Detection")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -754,6 +943,11 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         mosaic = score["band_mosaic"]
         modo_str = "energia audio reale" if mosaic["mode"] == "audio" else "procedurale (nessun audio)"
         righe.append(f"* Mosaico: 4x3 celle (bassi/medi/alti), ogni {mosaic['block_seconds']:.1f}s, {modo_str}")
+    if module_id == "03":
+        n_dev = len(score["deviation_events"])
+        n_dev_audio = sum(1 for e in score["deviation_events"] if e["source"] == "audio")
+        righe.append(f"* Deviazioni: {n_dev} totali ({n_dev_audio} da colpi audio forti, "
+                      f"{n_dev - n_dev_audio} procedurali)")
     righe.append(f"* Colonna sonora: {params['audio_mode']}")
     righe.append(f"* Eventi totali: {len(score['events'])}")
     righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
@@ -801,11 +995,18 @@ modulo_label = st.radio(
 module_id = modulo_label.split(" — ")[0]
 MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {module_id}"
 MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
-render_frame_fn = render_frame_ikeda if module_id == "01" else render_frame_henke
-synthesize_audio_fn = synthesize_audio_ikeda if module_id == "01" else synthesize_audio_henke
+
+RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar}
+SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar}
+render_frame_fn = RENDER_FNS[module_id]
+synthesize_audio_fn = SYNTH_FNS[module_id]
+
 if module_id == "02":
     st.caption("Modulo Henke: un mosaico di 12 blocchi (4 colonne × bassi/medi/alti) "
                "si ricompone in base all'energia reale delle tre bande di frequenza.")
+elif module_id == "03":
+    st.caption("Modulo Molnár: una griglia rigida resta quasi sempre identica. Devia "
+               "solo sui colpi audio davvero forti (o raramente da sé, senza audio).")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -868,7 +1069,8 @@ with st.sidebar:
         st.markdown("---")
         show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
                                           disabled=(palette != "Multicolore (per fonte)"))
-    else:
+        grid_cols, accent_color = 10, (235, 40, 60)
+    elif module_id == "02":
         # Modulo Henke: il mosaico è sempre colorato per banda — niente orientamento/
         # linee/palette (non esistono più grani da colorare individualmente)
         st.caption("Il mosaico si ricompone in base all'energia reale di bassi/medi/alti "
@@ -884,6 +1086,22 @@ with st.sidebar:
         band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
                         "treble": _hex_to_rgb(c_alti)}
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
+        grid_cols, accent_color = 10, (235, 40, 60)
+        show_source_legend = False
+    else:
+        # Modulo Molnár: griglia rigida, quasi sempre uniforme — solo densità e
+        # colore della deviazione sono personalizzabili, niente palette/orientamento
+        st.caption("La griglia resta identica quasi sempre. Scegli solo quanto è densa "
+                   "e di che colore diventa una cella quando devia.")
+        grid_cols = st.slider("Densità griglia (colonne)", 4, 20, 10)
+        c_accento = st.color_picker("Colore deviazione", "#EB2838")
+
+        def _hex_to_rgb(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+        accent_color = _hex_to_rgb(c_accento)
+        orientamento, num_lanes, palette, band_colors = "verticale", 10, "Multicolore (per fonte)", None
         show_source_legend = False
 
 # ------------------------------------------------------------
@@ -983,10 +1201,14 @@ if st.button("🚀 GENERA", use_container_width=True):
 
         st.write(f"Rendering fotogrammi a {export_w}x{export_h} (può richiedere qualche minuto)...")
 
+        extra_kwargs = {}
+        if module_id == "03":
+            extra_kwargs = {"grid_cols": grid_cols, "accent_color": accent_color}
+
         def make_frame(t):
             return render_frame_fn(t, score, width=export_w, height=export_h,
                                     orientation=orientamento, num_lanes=num_lanes,
-                                    palette=palette, band_colors=band_colors)
+                                    palette=palette, band_colors=band_colors, **extra_kwargs)
 
         clip = VideoClip(make_frame, duration=score["duration"])
         clip = clip.with_fps(FPS) if hasattr(clip, "with_fps") else clip.set_fps(FPS)
