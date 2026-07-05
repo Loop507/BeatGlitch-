@@ -525,9 +525,9 @@ def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
         frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
 
     # MOSAICO (Henke): 3 righe — alti/medi/bassi dall'alto in basso — 4 celle ciascuna.
-    # Ogni cella nella riga legge la STESSA banda ma in un istante leggermente
-    # sfasato (effetto "eco a cascata"): non rumore casuale, energia reale della
-    # banda, letta con un piccolo ritardo diverso per ogni colonna.
+    # Il livello base (lento, ~3s) resta uguale su tutta la riga: nessuno sfasamento
+    # meccanico artificiale, quello dava l'impressione di "accendersi in sequenza"
+    # a prescindere dal brano. Il ritmo vero arriva dai colpi reali (sotto).
     mosaic = score["band_mosaic"]
     mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
     bc = band_colors or DEFAULT_BAND_COLORS
@@ -535,20 +535,48 @@ def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
     cols = 4
     cell_w, cell_h = width / cols, height / len(rows_bands)
 
+    base_vals = {}
     for r, band_name in enumerate(rows_bands):
-        band_data = mosaic[band_name]
+        val = _band_block_value(mosaic[band_name], mode, block_seconds, t)
+        base_vals[band_name] = val
+        fill = 0.22 + 0.55 * val
+        shade = 0.30 + 0.55 * val
+        base_color = bc.get(band_name, (140, 140, 150))
+        color = tuple(int(ch * shade) for ch in base_color)
         for c in range(cols):
-            offset = c * (block_seconds / cols)
-            val = _band_block_value(band_data, mode, block_seconds, t - offset)
-            fill = 0.22 + 0.68 * val
             bw, bh = cell_w * fill, cell_h * fill
             cx, cy = c * cell_w + cell_w / 2, r * cell_h + cell_h / 2
             x0, y0 = int(cx - bw / 2), int(cy - bh / 2)
             x1, y1 = int(cx + bw / 2), int(cy + bh / 2)
-            shade = 0.35 + 0.65 * val
-            base_color = bc.get(band_name, (140, 140, 150))
-            color = tuple(int(ch * shade) for ch in base_color)
             cv2.rectangle(frame, (x0, y0), (x1, y1), color, -1)
+
+    # GUIZZO RITMICO: ogni colpo reale (cassa/rullante/hi-hat, dagli onset audio)
+    # accende brevemente la cella della sua riga — la colonna dipende dal pan reale
+    # del colpo, quindi si sposta leggermente invece di essere sempre nello stesso punto.
+    for e in score["events"]:
+        band_name = e.get("band")
+        if e.get("source") != "audio" or band_name not in rows_bands:
+            continue
+        pulse_dur = max(e["dur"], 0.12)
+        if not (e["t"] <= t <= e["t"] + pulse_dur):
+            continue
+        prog = (t - e["t"]) / pulse_dur
+        decay = 1.0 - prog  # il guizzo si spegne nel corso della sua durata
+
+        r = rows_bands.index(band_name)
+        lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
+        c = int(lane_frac * cols)
+
+        pulse_fill = min(0.98, (0.22 + 0.55 * base_vals[band_name]) + 0.45 * decay * e["vel"])
+        pulse_shade = min(1.0, 0.6 + 0.4 * decay * e["vel"])
+        base_color = bc.get(band_name, (140, 140, 150))
+        color = tuple(int(ch * pulse_shade) for ch in base_color)
+
+        bw, bh = cell_w * pulse_fill, cell_h * pulse_fill
+        cx, cy = c * cell_w + cell_w / 2, r * cell_h + cell_h / 2
+        x0, y0 = int(cx - bw / 2), int(cy - bh / 2)
+        x1, y1 = int(cx + bw / 2), int(cy + bh / 2)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), color, -1)
 
     return frame
 
