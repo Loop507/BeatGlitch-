@@ -110,6 +110,25 @@ def macro_block_value(macro_blocks, t):
     return float(macro_blocks["values"][idx])
 
 
+def generate_macro_grid(duration, seed, cols=4, rows=3, block_seconds=3.0):
+    """Mosaico di blocchi macro indipendenti (Henke): non una singola striscia, ma una
+    griglia di grandi zone geometriche. Ogni cella ha la propria sequenza a gradini e
+    uno sfasamento temporale diverso, così i blocchi non scattano tutti insieme —
+    creano una composizione che si ricompone a pezzi nel tempo, non un unico respiro."""
+    n = cols * rows
+    cells = []
+    for i in range(n):
+        blocks = generate_macro_blocks(duration, seed + i * 131, block_seconds=block_seconds)
+        stagger = (i / n) * block_seconds
+        cells.append({"blocks": blocks, "stagger": stagger})
+    return {"cols": cols, "rows": rows, "cells": cells, "block_seconds": block_seconds}
+
+
+def macro_grid_cell_value(macro_grid, cell_index, t):
+    cell = macro_grid["cells"][cell_index]
+    return macro_block_value(cell["blocks"], t + cell["stagger"])
+
+
 def cellular_automaton(rule, width, steps, seed):
     rng = np.random.RandomState(seed)
     row = rng.randint(0, 2, width)
@@ -317,6 +336,7 @@ def build_score(duration, seed, rule=30,
 
     macro = generate_macro_envelope_procedural(duration, effective_seed, resolution)
     macro_blocks = generate_macro_blocks(duration, effective_seed, block_seconds=macro_block_seconds)
+    macro_grid = generate_macro_grid(duration, effective_seed, block_seconds=macro_block_seconds)
     external_envs = [e for e in (audio_env, video_env) if e is not None and len(e) > 1]
     silence_envelope = None  # se presente, pilota il "gate silenzio" nel rendering
     if external_envs:
@@ -346,6 +366,7 @@ def build_score(duration, seed, rule=30,
         "duration": duration,
         "seed": effective_seed,
         "macro_blocks": macro_blocks,
+        "macro_grid": macro_grid,
         "events": events,
         "macro_envelope": macro,
         "silence_envelope": silence_envelope,
@@ -376,6 +397,14 @@ def _event_orientation(e, mode):
     if band == "treble":
         return "orizzontale"
     return "verticale" if int(e["t"] * 10) % 2 == 0 else "orizzontale"
+
+
+def _event_grain_offsets(e, n_grains=7):
+    """Offset relativi (-1..1) deterministici per i grani di un evento — stessa
+    disposizione per tutta la durata dell'evento, non ridisegnata a caso ogni frame."""
+    seed = int((e["t"] * 1000) % 100000)
+    rng = np.random.RandomState(seed)
+    return rng.uniform(-1.0, 1.0, (n_grains, 2))
 
 
 def render_frame_ikeda(t, score, width=960, height=540, orientation="verticale",
@@ -464,19 +493,32 @@ def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
         for gy in range(0, height, grid_step):
             frame[gy, :] = (grid_alpha, grid_alpha, grid_alpha)
 
-    # STRATO MACRO (Henke): una banda strutturale a gradini, che cambia di scatto
-    # ai confini di blocco — mai fusa/interpolata col micro. Resta visibile ANCHE
-    # durante il silenzio: è la struttura sostenuta, non la reazione istantanea.
-    block_val = macro_block_value(score["macro_blocks"], t)
-    macro_gray = int(35 + block_val * 55)
-    if orientation == "orizzontale":
-        band_w = int(width * (0.10 + 0.20 * block_val))
-        x0 = width // 2 - band_w // 2
-        cv2.rectangle(frame, (x0, 0), (x0 + band_w, height), (macro_gray, macro_gray, macro_gray), -1)
-    else:
-        band_h = int(height * (0.10 + 0.20 * block_val))
-        y0 = height // 2 - band_h // 2
-        cv2.rectangle(frame, (0, y0), (width, y0 + band_h), (macro_gray, macro_gray, macro_gray), -1)
+    # STRATO MACRO (Henke): un MOSAICO di grandi blocchi geometrici, non una singola
+    # striscia — ogni cella ha il proprio ritmo di cambio (scaglionato), così la
+    # composizione si ricompone a pezzi nel tempo. Resta visibile ANCHE durante il
+    # silenzio: è la struttura sostenuta, non la reazione istantanea al singolo colpo.
+    grid = score["macro_grid"]
+    cols, rows = grid["cols"], grid["rows"]
+    cell_w, cell_h = width / cols, height / rows
+
+    # tinta di base: neutra (grigio) se palette multicolore, altrimenti versione
+    # smorzata del colore scelto — coerente col resto ma sempre più tenue dei grani
+    palette_base = PALETTES.get(palette)
+    base_tint = palette_base if isinstance(palette_base, tuple) else (140, 140, 150)
+
+    for cell_idx in range(cols * rows):
+        r, c = divmod(cell_idx, cols)
+        val = macro_grid_cell_value(grid, cell_idx, t)
+        # ogni cella riempie una frazione variabile della propria area (mai fissa):
+        # un salto di valore alto = blocco quasi pieno, basso = blocco piccolo e centrato
+        fill = 0.25 + 0.65 * val
+        bw, bh = cell_w * fill, cell_h * fill
+        cx, cy = c * cell_w + cell_w / 2, r * cell_h + cell_h / 2
+        x0, y0 = int(cx - bw / 2), int(cy - bh / 2)
+        x1, y1 = int(cx + bw / 2), int(cy + bh / 2)
+        shade = 0.25 + 0.55 * val
+        color = tuple(int(ch * shade) for ch in base_tint)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), color, -1)
 
     # gate silenzio: durante il silenzio reale lo strato MICRO non deve comparire —
     # la macro resta comunque visibile (è la separazione netta macro/micro di Henke)
@@ -488,41 +530,41 @@ def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
             return frame  # silenzio: griglia + banda macro, ma nessun grano micro
 
     active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
-    num_lanes = max(1, int(num_lanes))
 
     for e in active:
-        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        prog = min(1.0, (t - e["t"]) / max(e["dur"], 0.05))
         color = get_event_color(e, palette, band_colors)
 
         band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
             (1.0 if e["source"] == "ca" else 1.6)
-        # lo spessore riflette SOLO banda+intensità del colpo — mai il valore macro,
-        # per rispettare la separazione netta macro/micro
         intensity_factor = 0.5 + 0.9 * e["vel"]
-        thickness_factor = band_thickness * intensity_factor
 
+        # centro della nuvola: x dal pan/pitch (come in Ikeda), y dalla banda —
+        # bassi in basso, alti in alto, medi al centro: dà struttura senza usare barre
         lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
-        lane_idx = int(lane_frac * num_lanes)
+        cx = lane_frac * width
+        band = e.get("band")
+        y_bias = {"bass": 0.78, "mid": 0.5, "treble": 0.22}.get(band, 0.5)
+        cy = y_bias * height
 
-        extent_frac = (0.45 + 0.55 * e["vel"]) * (1 - prog * 0.15)
-        event_orientation = _event_orientation(e, orientation)
+        # i grani si disperdono dal centro verso l'esterno nel tempo (sintesi
+        # granulare: un'esplosione di puntini, non una linea sostenuta)
+        spread_x = width * 0.05 * (0.3 + prog) * (0.6 + 0.6 * e["vel"])
+        spread_y = height * 0.05 * (0.3 + prog) * (0.6 + 0.6 * e["vel"])
+        if orientation == "orizzontale":
+            spread_x *= 2.2
+        elif orientation == "verticale":
+            spread_y *= 2.2
 
-        if event_orientation == "verticale":
-            lane_w = width / num_lanes
-            x_center = lane_idx * lane_w + lane_w / 2
-            bar_w = int(np.clip(lane_w * 0.75 * thickness_factor, 4, lane_w * 0.98))
-            bar_len = int(height * extent_frac)
-            y0 = height // 2 - bar_len // 2
-            x0 = int(x_center - bar_w / 2)
-            cv2.rectangle(frame, (x0, y0), (x0 + bar_w, y0 + max(bar_len, 2)), color, -1)
-        else:  # orizzontale
-            lane_h = height / num_lanes
-            y_center = lane_idx * lane_h + lane_h / 2
-            bar_h = int(np.clip(lane_h * 0.75 * thickness_factor, 4, lane_h * 0.98))
-            bar_len = int(width * extent_frac)
-            x0 = width // 2 - bar_len // 2
-            y0 = int(y_center - bar_h / 2)
-            cv2.rectangle(frame, (x0, y0), (x0 + max(bar_len, 2), y0 + bar_h), color, -1)
+        radius = max(2, int(3 * band_thickness * intensity_factor * (1 - prog * 0.4)))
+        fade = 1.0 - prog * 0.5  # i grani si affievoliscono man mano che si allontanano
+        grain_color = tuple(int(c * fade) for c in color)
+
+        for ox, oy in _event_grain_offsets(e):
+            gx = int(cx + ox * spread_x)
+            gy = int(cy + oy * spread_y)
+            if 0 <= gx < width and 0 <= gy < height:
+                cv2.circle(frame, (gx, gy), radius, grain_color, -1)
 
     return frame
 
@@ -697,8 +739,10 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
     righe.append(f"* Risoluzione: {params['resolution']}")
     righe.append(f"* Durata: {score['duration']:.1f}s")
     if module_id == "02":
-        n_blocks = len(score["macro_blocks"]["values"])
-        righe.append(f"* Blocchi macro: {n_blocks} (ogni {score['macro_blocks']['block_seconds']:.1f}s)")
+        grid = score["macro_grid"]
+        n_cells = grid["cols"] * grid["rows"]
+        righe.append(f"* Mosaico macro: {grid['cols']}x{grid['rows']} celle ({n_cells}), "
+                      f"ogni {grid['block_seconds']:.1f}s (scaglionate)")
     righe.append(f"* Colonna sonora: {params['audio_mode']}")
     righe.append(f"* Eventi totali: {len(score['events'])}")
     righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
