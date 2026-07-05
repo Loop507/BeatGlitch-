@@ -10,11 +10,27 @@ import cv2
 SR = 44100
 FPS = 30
 
-# Questo modulo (01) è dedicato al riferimento Ikeda — la suite prevede altri moduli
-# (02/03/04) dedicati agli altri riferimenti concettuali della serie BeatGlitch.
-MODULE_ID = "01"
-MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {MODULE_ID}"
-MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{MODULE_ID}"
+# Ogni modulo della serie BeatGlitch — Matrice Engine è dedicato a un riferimento
+# concettuale diverso. 01=Ikeda (rigore/automa cellulare), 02=Henke (separazione
+# macro/micro). 03/04 (Molnár/Jeck) arriveranno in seguito con lo stesso schema.
+MODULES = {
+    "01": {
+        "nome": "Ikeda — Cellular Drift",
+        "effetto": "Cellular Drift",
+        "processo": "Matrice Condivisa",
+        "motore_tag": "generativo condiviso",
+        "quote": "Un unico dato ha generato insieme cio\' che si vede e cio\' che si sente.",
+        "hashtag": "#cellularautomaton #computationalminimalism",
+    },
+    "02": {
+        "nome": "Henke — Macro/Micro Split",
+        "effetto": "Macro Block Drift",
+        "processo": "Struttura a Blocchi + Grana Micro",
+        "motore_tag": "macro/micro separati",
+        "quote": "La struttura non sfuma. Cambia di scatto, mentre la grana continua a vibrare.",
+        "hashtag": "#macromicron #granularsynthesis",
+    },
+}
 
 SOURCE_COLOR = {
     "ca":    (235, 235, 235),   # procedurale — bianco/grigio
@@ -78,6 +94,20 @@ def value_noise_1d(n_points, seed, octaves=5, persistence=0.55, base_freq=3):
 def generate_macro_envelope_procedural(duration, seed, resolution=200):
     env = value_noise_1d(resolution, seed)
     return (env - env.min()) / (env.max() - env.min() + 1e-9)
+
+
+def generate_macro_blocks(duration, seed, block_seconds=3.0):
+    """Struttura macro a GRADINI discreti (usata dal modulo Henke): ogni blocco ha un
+    livello fisso, il cambio tra blocchi è netto — non un'interpolazione continua."""
+    n_blocks = max(1, int(np.ceil(duration / block_seconds)))
+    rng = np.random.RandomState(seed + 777)
+    values = rng.uniform(0.15, 1.0, n_blocks)
+    return {"block_seconds": block_seconds, "values": values}
+
+
+def macro_block_value(macro_blocks, t):
+    idx = min(len(macro_blocks["values"]) - 1, int(t // macro_blocks["block_seconds"]))
+    return float(macro_blocks["values"][idx])
 
 
 def cellular_automaton(rule, width, steps, seed):
@@ -277,7 +307,7 @@ def build_score(duration, seed, rule=30,
                  midi_events=None,
                  audio_events=None, audio_env=None,
                  video_events=None, video_env=None,
-                 resolution=200):
+                 resolution=200, macro_block_seconds=3.0):
     has_external = bool(midi_events or audio_events or video_events)
 
     # il seed "di base" pilotato dall'utente resta riproducibile, ma viene perturbato
@@ -286,6 +316,7 @@ def build_score(duration, seed, rule=30,
     effective_seed = seed + _content_seed_offset(audio_env, video_env, midi_events)
 
     macro = generate_macro_envelope_procedural(duration, effective_seed, resolution)
+    macro_blocks = generate_macro_blocks(duration, effective_seed, block_seconds=macro_block_seconds)
     external_envs = [e for e in (audio_env, video_env) if e is not None and len(e) > 1]
     silence_envelope = None  # se presente, pilota il "gate silenzio" nel rendering
     if external_envs:
@@ -314,6 +345,7 @@ def build_score(duration, seed, rule=30,
     return {
         "duration": duration,
         "seed": effective_seed,
+        "macro_blocks": macro_blocks,
         "events": events,
         "macro_envelope": macro,
         "silence_envelope": silence_envelope,
@@ -346,8 +378,8 @@ def _event_orientation(e, mode):
     return "verticale" if int(e["t"] * 10) % 2 == 0 else "orizzontale"
 
 
-def render_frame(t, score, width=960, height=540, orientation="verticale",
-                  num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
+def render_frame_ikeda(t, score, width=960, height=540, orientation="verticale",
+                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     res = len(score["macro_envelope"])
     env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
@@ -414,11 +446,92 @@ def render_frame(t, score, width=960, height=540, orientation="verticale",
     return frame
 
 
+def render_frame_henke(t, score, width=960, height=540, orientation="verticale",
+                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+
+    # griglia sottile di fondo — in modalità mista mostra entrambi gli assi
+    grid_alpha = int(12 + macro_v * 18)
+    if orientation in ("verticale", "misto"):
+        grid_step = max(8, width // 24)
+        for gx in range(0, width, grid_step):
+            frame[:, gx] = (grid_alpha, grid_alpha, grid_alpha)
+    if orientation in ("orizzontale", "misto"):
+        grid_step = max(8, height // 24)
+        for gy in range(0, height, grid_step):
+            frame[gy, :] = (grid_alpha, grid_alpha, grid_alpha)
+
+    # STRATO MACRO (Henke): una banda strutturale a gradini, che cambia di scatto
+    # ai confini di blocco — mai fusa/interpolata col micro. Resta visibile ANCHE
+    # durante il silenzio: è la struttura sostenuta, non la reazione istantanea.
+    block_val = macro_block_value(score["macro_blocks"], t)
+    macro_gray = int(35 + block_val * 55)
+    if orientation == "orizzontale":
+        band_w = int(width * (0.10 + 0.20 * block_val))
+        x0 = width // 2 - band_w // 2
+        cv2.rectangle(frame, (x0, 0), (x0 + band_w, height), (macro_gray, macro_gray, macro_gray), -1)
+    else:
+        band_h = int(height * (0.10 + 0.20 * block_val))
+        y0 = height // 2 - band_h // 2
+        cv2.rectangle(frame, (0, y0), (width, y0 + band_h), (macro_gray, macro_gray, macro_gray), -1)
+
+    # gate silenzio: durante il silenzio reale lo strato MICRO non deve comparire —
+    # la macro resta comunque visibile (è la separazione netta macro/micro di Henke)
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / max(score["duration"], 1e-6)) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame  # silenzio: griglia + banda macro, ma nessun grano micro
+
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    num_lanes = max(1, int(num_lanes))
+
+    for e in active:
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        color = get_event_color(e, palette, band_colors)
+
+        band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
+            (1.0 if e["source"] == "ca" else 1.6)
+        # lo spessore riflette SOLO banda+intensità del colpo — mai il valore macro,
+        # per rispettare la separazione netta macro/micro
+        intensity_factor = 0.5 + 0.9 * e["vel"]
+        thickness_factor = band_thickness * intensity_factor
+
+        lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
+        lane_idx = int(lane_frac * num_lanes)
+
+        extent_frac = (0.45 + 0.55 * e["vel"]) * (1 - prog * 0.15)
+        event_orientation = _event_orientation(e, orientation)
+
+        if event_orientation == "verticale":
+            lane_w = width / num_lanes
+            x_center = lane_idx * lane_w + lane_w / 2
+            bar_w = int(np.clip(lane_w * 0.75 * thickness_factor, 4, lane_w * 0.98))
+            bar_len = int(height * extent_frac)
+            y0 = height // 2 - bar_len // 2
+            x0 = int(x_center - bar_w / 2)
+            cv2.rectangle(frame, (x0, y0), (x0 + bar_w, y0 + max(bar_len, 2)), color, -1)
+        else:  # orizzontale
+            lane_h = height / num_lanes
+            y_center = lane_idx * lane_h + lane_h / 2
+            bar_h = int(np.clip(lane_h * 0.75 * thickness_factor, 4, lane_h * 0.98))
+            bar_len = int(width * extent_frac)
+            x0 = width // 2 - bar_len // 2
+            y0 = int(y_center - bar_h / 2)
+            cv2.rectangle(frame, (x0, y0), (x0 + max(bar_len, 2), y0 + bar_h), color, -1)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
 
-def synthesize_audio(score, sr=SR):
+def synthesize_audio_ikeda(score, sr=SR):
     duration = max(score["duration"], 0.1)
     N = int(duration * sr)
     out_l = np.zeros(N)
@@ -461,6 +574,64 @@ def synthesize_audio(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_henke(score, sr=SR):
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
+    t_ax = np.linspace(0, duration, N)
+
+    tex_full = np.interp(t_ax, np.linspace(0, duration, len(score["micro_texture"])), score["micro_texture"])
+
+    # drone MACRO (Henke): livello a gradini discreti, uno per blocco — cambia di scatto
+    # ai confini (con una brevissima rampa di pochi ms solo per evitare click, non per
+    # sfumare gradualmente: la transizione resta percepibile come taglio netto)
+    mb = score["macro_blocks"]
+    block_idx = np.minimum(len(mb["values"]) - 1, (t_ax // mb["block_seconds"]).astype(int))
+    block_level = mb["values"][block_idx]
+    ramp_samples = max(1, int(0.015 * sr))  # ~15ms, solo anti-click
+    if ramp_samples > 1:
+        kernel = np.ones(ramp_samples) / ramp_samples
+        block_level = np.convolve(block_level, kernel, mode="same")
+
+    base_freq = 55.0
+    drone_freq = base_freq * (1 + block_level * 1.2)  # la frequenza segue il gradino, non il rumore
+    phase = 2 * np.pi * np.cumsum(drone_freq) / sr
+    drone = np.sin(phase) * (0.05 + 0.10 * block_level)
+    out_l += drone
+    out_r += drone
+
+    # eventi discreti — ogni fonte ha lo stesso motore di sintesi (stessa "grammatica"),
+    # posizionati in stereo secondo il pan reale (0.0 = centro, per fonti senza pan noto)
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.03 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 440.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        wave = np.sin(2 * np.pi * freq * seg_t) * e["vel"]
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = wave * env_local * 0.45
+
+        # grana granulare (Henke: la texture micro non è solo tono puro ma ha "grain")
+        tex_val = float(tex_full[min(start, N - 1)])
+        grain_seed = int((e["t"] * 1000) % 100000)
+        noise_grain = np.random.RandomState(grain_seed).uniform(-1, 1, seg_len)
+        signal = signal + noise_grain * env_local * tex_val * e["vel"] * 0.12
+
+        pan = e.get("pan", 0.0)
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -479,8 +650,9 @@ def fit_audio_length(y, N):
         return np.tile(y, (1, reps))[:, :N]
 
 
-def generate_text_report(params, score, brand="Loop507", vol=None):
+def generate_text_report(params, score, module_id="01", brand="Loop507", vol=None):
     """Report nel formato standard Loop507 (:: MOTORE / EFFETTO / TECHNICAL LOG SHEET)."""
+    meta = MODULES[module_id]
     counts = {}
     for e in score["events"]:
         counts[e["source"]] = counts.get(e["source"], 0) + 1
@@ -500,27 +672,33 @@ def generate_text_report(params, score, brand="Loop507", vol=None):
         analisi.append("Scene Cut Detection")
     if counts.get("midi", 0) > 0:
         analisi.append("MIDI Parsing")
+    if module_id == "02":
+        analisi.append("Macro Block Segmentation")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
 
     righe = []
-    righe.append(f"[BEATGLITCH_MATRICE_ENGINE_{MODULE_ID}] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
-    righe.append(f":: MOTORE: matrice_engine_{MODULE_ID} [v1.0 — generativo condiviso]")
-    righe.append(f":: EFFETTO: Cellular Drift — Regola {params['rule']}")
+    righe.append(f"[BEATGLITCH_MATRICE_ENGINE_{module_id}] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
+    righe.append(f":: MOTORE: matrice_engine_{module_id} [v1.0 — {meta['motore_tag']}]")
+    righe.append(f":: EFFETTO: {meta['effetto']} — Regola {params['rule']}")
     righe.append(f":: ANALISI: {' / '.join(analisi)}")
     fonti_str = " + ".join(fonti_attive) if fonti_attive else "Nessuna (generazione pura)"
-    righe.append(f":: PROCESSO: Matrice Condivisa — Fonti: {fonti_str}")
+    righe.append(f":: PROCESSO: {meta['processo']} — Fonti: {fonti_str}")
     righe.append("")
-    righe.append('"Un unico dato ha generato insieme cio\' che si vede e cio\' che si sente."')
+    righe.append(f'"{meta["quote"]}"')
     righe.append("")
     righe.append("> TECHNICAL LOG SHEET:")
     righe.append(f"* File: matrice_output_{params['timestamp'].replace('/', '').replace(':', '').replace(' ', '_')}")
+    righe.append(f"* Modulo: {module_id} — {meta['nome']}")
     righe.append(f"* Seed (utente): {params['seed']}")
     righe.append(f"* Seed effettivo: {score['seed']} (perturbato dal contenuto delle fonti esterne)")
     righe.append(f"* Rendering: {n_frames} frame @ {FPS}fps")
     righe.append(f"* Risoluzione: {params['resolution']}")
     righe.append(f"* Durata: {score['duration']:.1f}s")
+    if module_id == "02":
+        n_blocks = len(score["macro_blocks"]["values"])
+        righe.append(f"* Blocchi macro: {n_blocks} (ogni {score['macro_blocks']['block_seconds']:.1f}s)")
     righe.append(f"* Colonna sonora: {params['audio_mode']}")
     righe.append(f"* Eventi totali: {len(score['events'])}")
     righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
@@ -535,7 +713,7 @@ def generate_text_report(params, score, brand="Loop507", vol=None):
     righe.append("")
     righe.append(f"> Regia e Algoritmo: {brand}")
     righe.append("")
-    righe.append("#generativeart #proceduralart #cellularautomaton #digitalminimalism")
+    righe.append(f"#generativeart #proceduralart #digitalminimalism {meta['hashtag']}")
     righe.append("#computationalminimalism #brutalistart #glitchart #audiovisual")
     righe.append("#experimentalvideo #beatglitch")
 
@@ -555,10 +733,24 @@ except ModuleNotFoundError:
     from moviepy import VideoClip, AudioFileClip  # moviepy 2.x
 import soundfile as sf
 
-st.set_page_config(page_title=MODULE_TITLE, layout="wide")
-st.title(f"◧ {MODULE_TITLE}")
+st.set_page_config(page_title="BeatGlitch — Matrice Engine", layout="wide")
+st.title("◧ BEATGLITCH — MATRICE ENGINE")
 st.caption("Generazione audio-video procedurale da una struttura dati condivisa. "
            "MIDI, audio e video sono opzionali: senza input, il sistema genera da sé.")
+
+modulo_label = st.radio(
+    "Modulo",
+    [f"{mid} — {MODULES[mid]['nome']}" for mid in MODULES],
+    horizontal=True,
+)
+module_id = modulo_label.split(" — ")[0]
+MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {module_id}"
+MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
+render_frame_fn = render_frame_ikeda if module_id == "01" else render_frame_henke
+synthesize_audio_fn = synthesize_audio_ikeda if module_id == "01" else synthesize_audio_henke
+if module_id == "02":
+    st.caption("Modulo Henke: la banda macro (struttura a blocchi) resta visibile anche "
+               "nel silenzio — solo i grani micro reagiscono all'istante presente.")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -699,7 +891,7 @@ if st.button("🚀 GENERA", use_container_width=True):
 
         st.write("Costruzione colonna sonora finale...")
         N = int(score["duration"] * SR)
-        generated = synthesize_audio(score, sr=SR)  # shape (2, N)
+        generated = synthesize_audio_fn(score, sr=SR)  # shape (2, N)
 
         if audio_mode == "Originale (file caricato)" and audio_raw is not None:
             final_audio = fit_audio_length(audio_raw, N)
@@ -716,9 +908,9 @@ if st.button("🚀 GENERA", use_container_width=True):
         st.write(f"Rendering fotogrammi a {export_w}x{export_h} (può richiedere qualche minuto)...")
 
         def make_frame(t):
-            return render_frame(t, score, width=export_w, height=export_h,
-                                 orientation=orientamento, num_lanes=num_lanes,
-                                 palette=palette, band_colors=band_colors)
+            return render_frame_fn(t, score, width=export_w, height=export_h,
+                                    orientation=orientamento, num_lanes=num_lanes,
+                                    palette=palette, band_colors=band_colors)
 
         clip = VideoClip(make_frame, duration=score["duration"])
         clip = clip.with_fps(FPS) if hasattr(clip, "with_fps") else clip.set_fps(FPS)
@@ -737,7 +929,7 @@ if st.button("🚀 GENERA", use_container_width=True):
             "resolution": f"{export_w}x{export_h}", "audio_mode": audio_mode,
             "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M"),
         }
-        report_text = generate_text_report(report_params, score)
+        report_text = generate_text_report(report_params, score, module_id=module_id)
 
         status.update(label="Fatto!", state="complete")
 
