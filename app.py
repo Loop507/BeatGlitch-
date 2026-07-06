@@ -672,10 +672,13 @@ def render_frame_molnar(t, score, width=960, height=540, orientation="verticale"
 
         if idx in cell_state:
             dtype, decay, e = cell_state[idx]
-            # ogni deviazione, di qualunque tipo, lampeggia SEMPRE verso il colore
-            # d'accento — prima la cella si muoveva/ruotava restando grigia, e per
-            # 3 tipi su 4 sembrava "non colorarsi mai" (era vero, letteralmente)
-            color = tuple(int(a + (b - a) * decay) for a, b in zip(base_color, accent_color))
+            # colore diverso per banda (come nelle altre matrici): un colpo di
+            # bassi devia in un colore, uno di alti in un altro. Le deviazioni
+            # procedurali (senza banda, quando non c'è audio) usano un grigio chiaro.
+            bc = band_colors or DEFAULT_BAND_COLORS
+            band_name = e.get("band")
+            target_color = bc.get(band_name, accent_color) if band_name else accent_color
+            color = tuple(int(a + (b - a) * decay) for a, b in zip(base_color, target_color))
             offset, angle, half_eff = (0, 0), 0.0, half
 
             if dtype == "posizione":
@@ -1084,12 +1087,15 @@ with st.sidebar:
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = False
     else:
-        # Modulo Molnár: griglia rigida, quasi sempre uniforme — solo densità e
-        # colore della deviazione sono personalizzabili, niente palette/orientamento
-        st.caption("La griglia resta identica quasi sempre. Scegli solo quanto è densa "
-                   "e di che colore diventa una cella quando devia.")
+        # Modulo Molnár: griglia rigida, quasi sempre uniforme — densità, colori
+        # per banda e ritmo delle deviazioni sono personalizzabili
+        st.caption("La griglia resta identica quasi sempre. Il colore della deviazione "
+                   "dipende dalla banda del colpo che l'ha causata (bassi/medi/alti).")
         grid_cols = st.slider("Densità griglia (colonne)", 4, 20, 10)
-        c_accento = st.color_picker("Colore deviazione", "#EB2838")
+        c_bassi = st.color_picker("Deviazione da bassi", "#EB2828")
+        c_medi = st.color_picker("Deviazione da medi", "#FFAA00")
+        c_alti = st.color_picker("Deviazione da alti", "#00C8FF")
+        c_procedurale = st.color_picker("Deviazione procedurale (senza audio)", "#CCCCCC")
         deviation_sensitivity = st.slider(
             "Sensibilità deviazioni", 0.3, 0.9, 0.6, step=0.05,
             help="Più basso = più colpi audio fanno scattare una deviazione (più frequenti). "
@@ -1105,8 +1111,10 @@ with st.sidebar:
             h = h.lstrip("#")
             return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
-        accent_color = _hex_to_rgb(c_accento)
-        orientamento, num_lanes, palette, band_colors = "verticale", 10, "Multicolore (per fonte)", None
+        band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
+                        "treble": _hex_to_rgb(c_alti)}
+        accent_color = _hex_to_rgb(c_procedurale)
+        orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
         show_source_legend = False
 
 # ------------------------------------------------------------
