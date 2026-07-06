@@ -287,6 +287,16 @@ def _band_envelopes_over_time(y_mono, sr, n_fft=2048, hop_length=512):
     return {"bass": bass, "mid": mid, "treble": treble, "times": times}
 
 
+def _lowpass_filter(y, sr, cutoff=150.0, order=4):
+    """Filtro passa-basso (Butterworth, fase zero) per isolare la cassa/i bassi
+    prima di cercare gli attacchi — evita che hi-hat/altri elementi del mix
+    mascherino o confondano il rilevatore di colpi."""
+    from scipy.signal import butter, filtfilt
+    nyq = sr / 2.0
+    b, a = butter(order, cutoff / nyq, btype="low")
+    return filtfilt(b, a, y)
+
+
 def extract_from_audio(audio_path):
     import librosa
     y_raw, sr = librosa.load(audio_path, sr=SR, mono=False)
@@ -297,29 +307,57 @@ def extract_from_audio(audio_path):
     y_mono = y_stereo.mean(axis=0)
     duration = y_mono.shape[0] / sr
 
-    onset_frames = librosa.onset.onset_detect(y=y_mono, sr=sr, backtrack=True)
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr)
     rms = librosa.feature.rms(y=y_mono)[0]
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
     band_envelopes = _band_envelopes_over_time(y_mono, sr)
-
     win = 2048
+
+    # onset "generici" sul mix intero — catturano rullanti/hi-hat/medi-alti
+    onset_frames = librosa.onset.onset_detect(y=y_mono, sr=sr, backtrack=True)
+    onset_times = list(librosa.frames_to_time(onset_frames, sr=sr))
+
+    # onset DEDICATI alla cassa/bassi: isolati con un passa-basso prima di cercare
+    # gli attacchi, così un basso continuo o un hi-hat non nascondono/confondono
+    # il colpo — risolve il problema della cassa che "non va a tempo"
+    y_bass = _lowpass_filter(y_mono, sr, cutoff=150.0)
+    bass_onset_frames = librosa.onset.onset_detect(y=y_bass, sr=sr, backtrack=True,
+                                                    pre_max=10, post_max=10, delta=0.15)
+    bass_onset_candidates = list(librosa.frames_to_time(bass_onset_frames, sr=sr))
+
+    # verifica incrociata: un candidato è un VERO colpo di cassa solo se, nel mix
+    # ORIGINALE non filtrato, i bassi sono davvero la banda dominante in quel punto —
+    # scarta i falsi positivi da elementi a banda larga (es. hi-hat) che lasciano un
+    # residuo a bassa frequenza anche dopo il filtro, senza essere davvero "bassi"
+    bass_onset_times = []
+    for bt in bass_onset_candidates:
+        sample_pos = int(bt * sr)
+        lo, hi = max(0, sample_pos - win // 2), sample_pos + win // 2
+        if _dominant_band(y_mono[lo:hi], sr) == "bass":
+            bass_onset_times.append(bt)
+
+    # tolgo dagli onset generici quelli troppo vicini a un colpo di cassa già
+    # individuato, per non contare due volte lo stesso istante
+    onset_times = [ot for ot in onset_times
+                    if not any(abs(ot - bt) < 0.06 for bt in bass_onset_times)]
+
     events = []
-    for ot in onset_times:
+
+    def _make_event(ot, forced_band=None):
         idx = int(np.argmin(np.abs(rms_times - ot)))
         vel = float(min(1.0, rms[idx] / (rms.max() + 1e-9)))
-
         sample_pos = int(ot * sr)
         lo, hi = max(0, sample_pos - win // 2), sample_pos + win // 2
-        window_mono = y_mono[lo:hi]
-        band = _dominant_band(window_mono, sr)
+        band = forced_band or _dominant_band(y_mono[lo:hi], sr)
         bp = BAND_PARAMS[band]
         pan = _pan_of_window(y_stereo[0, lo:hi], y_stereo[1, lo:hi])
+        return {"t": float(ot), "dur": bp["dur"], "pitch": bp["pitch"] + int(vel * 8),
+                "vel": vel, "source": "audio", "band": band, "pan": pan}
 
-        events.append({
-            "t": float(ot), "dur": bp["dur"], "pitch": bp["pitch"] + int(vel * 8),
-            "vel": vel, "source": "audio", "band": band, "pan": pan,
-        })
+    for bt in bass_onset_times:
+        events.append(_make_event(bt, forced_band="bass"))
+    for ot in onset_times:
+        events.append(_make_event(ot))
+    events.sort(key=lambda e: e["t"])
 
     env = rms / (rms.max() + 1e-9)
     return events, env, duration, y_stereo, band_envelopes
@@ -461,9 +499,18 @@ def build_score(duration, seed, rule=30,
 # 4. GENERATORE VISIVO
 # ============================================================
 
-def _lane_fraction(e):
-    """Posizione 0..1 lungo l'asse delle corsie: usa il pan stereo reale se disponibile
-    (eventi audio), altrimenti il pitch come proxy deterministico per le altre fonti."""
+def _lane_fraction(e, position_mode="pan"):
+    """Posizione 0..1 lungo l'asse delle corsie.
+    - 'pan': usa il pan stereo reale (eventi audio) o il pitch come fallback. Se il
+      mix è centrato/mono, tutti i colpi finiscono vicino al centro indipendentemente
+      dal numero di corsie impostato — è un riflesso del mix reale, non un bug.
+    - 'frequenza': ignora il pan e usa la banda (bassi=sinistra, alti=destra),
+      garantendo sempre distribuzione sull'intera larghezza qualunque sia il mix."""
+    if position_mode == "frequenza":
+        band = e.get("band")
+        band_center = {"bass": 0.15, "mid": 0.5, "treble": 0.85}.get(band, 0.5)
+        fine = ((e.get("pitch", 60) % 12) / 12 - 0.5) * 0.25
+        return min(0.999, max(0.0, band_center + fine))
     if "pan" in e:
         return (e["pan"] + 1.0) / 2.0  # da -1..1 a 0..1
     return (e["pitch"] % 96) / 96.0
@@ -483,7 +530,8 @@ def _event_orientation(e, mode):
 
 
 def render_frame_ikeda(t, score, width=960, height=540, orientation="verticale",
-                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
+                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                        position_mode="pan"):
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     res = len(score["macro_envelope"])
     env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
@@ -523,7 +571,7 @@ def render_frame_ikeda(t, score, width=960, height=540, orientation="verticale",
         intensity_factor = 0.5 + 0.9 * e["vel"]
         thickness_factor = band_thickness * intensity_factor
 
-        lane_frac = min(0.999, max(0.0, _lane_fraction(e)))
+        lane_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
         lane_idx = int(lane_frac * num_lanes)
 
         # barre più grandi di default: riempiono meglio la scena e calano più lentamente
@@ -1047,6 +1095,13 @@ with st.sidebar:
             st.caption("In modalità mista: bassi verticali (sostenuti), alti orizzontali (rapidi), "
                        "medi alternati nel tempo.")
         num_lanes = st.slider("Numero di linee", 1, 24, 10)
+        posizione_label = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                    horizontal=True,
+                                    help="Pan reale: segue la posizione stereo vera del colpo — se il mix è "
+                                         "centrato/mono, le barre restano vicine al centro qualunque sia il "
+                                         "numero di linee. Frequenza: ignora il pan, distribuisce sempre "
+                                         "sull'intera larghezza (bassi a sinistra, alti a destra).")
+        position_mode = "pan" if posizione_label == "Pan stereo reale" else "frequenza"
         palette = st.selectbox("Palette colore", list(PALETTES.keys()))
 
         band_colors = None
@@ -1085,6 +1140,7 @@ with st.sidebar:
                         "treble": _hex_to_rgb(c_alti)}
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        position_mode = "pan"
         show_source_legend = False
     else:
         # Modulo Molnár: griglia rigida, quasi sempre uniforme — densità, colori
@@ -1115,6 +1171,7 @@ with st.sidebar:
                         "treble": _hex_to_rgb(c_alti)}
         accent_color = _hex_to_rgb(c_procedurale)
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
+        position_mode = "pan"
         show_source_legend = False
 
 # ------------------------------------------------------------
@@ -1219,6 +1276,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         extra_kwargs = {}
         if module_id == "03":
             extra_kwargs = {"grid_cols": grid_cols, "accent_color": accent_color}
+        elif module_id == "01":
+            extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
             return render_frame_fn(t, score, width=export_w, height=export_h,
