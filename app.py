@@ -374,7 +374,8 @@ def build_score(duration, seed, rule=30,
                  midi_events=None,
                  audio_events=None, audio_env=None,
                  video_events=None, video_env=None, audio_band_envelopes=None,
-                 resolution=200, macro_block_seconds=3.0, deviation_strong_threshold=0.72):
+                 resolution=200, macro_block_seconds=3.0, deviation_strong_threshold=0.72,
+                 deviation_min_gap=1.0):
     has_external = bool(midi_events or audio_events or video_events)
 
     # il seed "di base" pilotato dall'utente resta riproducibile, ma viene perturbato
@@ -440,7 +441,7 @@ def build_score(duration, seed, rule=30,
 
     deviation_events = generate_deviation_events(
         duration, effective_seed, audio_events=audio_events, block_seconds=macro_block_seconds,
-        strong_threshold=deviation_strong_threshold,
+        strong_threshold=deviation_strong_threshold, min_gap=deviation_min_gap,
     )
 
     return {
@@ -1063,7 +1064,7 @@ with st.sidebar:
         st.markdown("---")
         show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
                                           disabled=(palette != "Multicolore (per fonte)"))
-        grid_cols, accent_color, deviation_sensitivity = 10, (235, 40, 60), 0.6
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
     elif module_id == "02":
         # Modulo Henke: il mosaico è sempre colorato per banda — niente orientamento/
         # linee/palette (non esistono più grani da colorare individualmente)
@@ -1080,7 +1081,7 @@ with st.sidebar:
         band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
                         "treble": _hex_to_rgb(c_alti)}
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
-        grid_cols, accent_color, deviation_sensitivity = 10, (235, 40, 60), 0.6
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = False
     else:
         # Modulo Molnár: griglia rigida, quasi sempre uniforme — solo densità e
@@ -1093,6 +1094,11 @@ with st.sidebar:
             "Sensibilità deviazioni", 0.3, 0.9, 0.6, step=0.05,
             help="Più basso = più colpi audio fanno scattare una deviazione (più frequenti). "
                  "Più alto = solo i colpi davvero più forti (più rare)."
+        )
+        deviation_min_gap = st.slider(
+            "Distanza minima tra deviazioni (s)", 0.15, 2.0, 1.0, step=0.05,
+            help="Abbassala per brani veloci (es. house/techno): a 1.0s le deviazioni "
+                 "non possono seguire una cassa più rapida di 60 bpm."
         )
 
         def _hex_to_rgb(h):
@@ -1180,6 +1186,7 @@ if st.button("🚀 GENERA", use_container_width=True):
             video_events=video_events, video_env=video_env,
             audio_band_envelopes=audio_band_envelopes,
             deviation_strong_threshold=deviation_sensitivity,
+            deviation_min_gap=deviation_min_gap,
         )
         st.write(f"Matrice pronta — {len(score['events'])} eventi totali.")
 
