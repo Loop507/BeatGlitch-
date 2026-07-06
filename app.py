@@ -374,7 +374,7 @@ def build_score(duration, seed, rule=30,
                  midi_events=None,
                  audio_events=None, audio_env=None,
                  video_events=None, video_env=None, audio_band_envelopes=None,
-                 resolution=200, macro_block_seconds=3.0):
+                 resolution=200, macro_block_seconds=3.0, deviation_strong_threshold=0.72):
     has_external = bool(midi_events or audio_events or video_events)
 
     # il seed "di base" pilotato dall'utente resta riproducibile, ma viene perturbato
@@ -439,7 +439,8 @@ def build_score(duration, seed, rule=30,
     texture = generate_micro_texture_procedural(resolution * 4, effective_seed)
 
     deviation_events = generate_deviation_events(
-        duration, effective_seed, audio_events=audio_events, block_seconds=macro_block_seconds
+        duration, effective_seed, audio_events=audio_events, block_seconds=macro_block_seconds,
+        strong_threshold=deviation_strong_threshold,
     )
 
     return {
@@ -670,27 +671,20 @@ def render_frame_molnar(t, score, width=960, height=540, orientation="verticale"
 
         if idx in cell_state:
             dtype, decay, e = cell_state[idx]
-            if dtype == "colore":
-                color = tuple(int(a + (b - a) * decay) for a, b in zip(base_color, accent_color))
-                half_eff = half
-                offset = (0, 0)
-                angle = 0.0
-            elif dtype == "posizione":
-                color = base_color
-                shift = half * 2.2 * decay
+            # ogni deviazione, di qualunque tipo, lampeggia SEMPRE verso il colore
+            # d'accento — prima la cella si muoveva/ruotava restando grigia, e per
+            # 3 tipi su 4 sembrava "non colorarsi mai" (era vero, letteralmente)
+            color = tuple(int(a + (b - a) * decay) for a, b in zip(base_color, accent_color))
+            offset, angle, half_eff = (0, 0), 0.0, half
+
+            if dtype == "posizione":
+                shift = half * 3.4 * decay  # movimento più ampio, prima era appena percettibile
                 offset = (shift, -shift * 0.6)
-                half_eff = half
-                angle = 0.0
             elif dtype == "dimensione":
-                color = base_color
-                half_eff = half * (1.0 + 1.6 * decay)
-                offset = (0, 0)
-                angle = 0.0
-            else:  # rotazione
-                color = base_color
-                half_eff = half
-                offset = (0, 0)
+                half_eff = half * (1.0 + 2.2 * decay)
+            elif dtype == "rotazione":
                 angle = 45.0 * decay
+            # "colore": solo il lampeggio, nessuna geometria aggiuntiva
         else:
             color, half_eff, offset, angle = base_color, half, (0, 0), 0.0
 
@@ -1069,7 +1063,7 @@ with st.sidebar:
         st.markdown("---")
         show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
                                           disabled=(palette != "Multicolore (per fonte)"))
-        grid_cols, accent_color = 10, (235, 40, 60)
+        grid_cols, accent_color, deviation_sensitivity = 10, (235, 40, 60), 0.6
     elif module_id == "02":
         # Modulo Henke: il mosaico è sempre colorato per banda — niente orientamento/
         # linee/palette (non esistono più grani da colorare individualmente)
@@ -1086,7 +1080,7 @@ with st.sidebar:
         band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
                         "treble": _hex_to_rgb(c_alti)}
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
-        grid_cols, accent_color = 10, (235, 40, 60)
+        grid_cols, accent_color, deviation_sensitivity = 10, (235, 40, 60), 0.6
         show_source_legend = False
     else:
         # Modulo Molnár: griglia rigida, quasi sempre uniforme — solo densità e
@@ -1095,6 +1089,11 @@ with st.sidebar:
                    "e di che colore diventa una cella quando devia.")
         grid_cols = st.slider("Densità griglia (colonne)", 4, 20, 10)
         c_accento = st.color_picker("Colore deviazione", "#EB2838")
+        deviation_sensitivity = st.slider(
+            "Sensibilità deviazioni", 0.3, 0.9, 0.6, step=0.05,
+            help="Più basso = più colpi audio fanno scattare una deviazione (più frequenti). "
+                 "Più alto = solo i colpi davvero più forti (più rare)."
+        )
 
         def _hex_to_rgb(h):
             h = h.lstrip("#")
@@ -1180,6 +1179,7 @@ if st.button("🚀 GENERA", use_container_width=True):
             audio_events=audio_events, audio_env=audio_env,
             video_events=video_events, video_env=video_env,
             audio_band_envelopes=audio_band_envelopes,
+            deviation_strong_threshold=deviation_sensitivity,
         )
         st.write(f"Matrice pronta — {len(score['events'])} eventi totali.")
 
