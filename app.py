@@ -795,7 +795,9 @@ def apply_visual_degradation(frame, t, seed, usura_level, memory_frame=None):
     """Strisce DISTRUTTE (Jeck): non un velo di rumore sopra l'immagine pulita, ma
     tagli orizzontali che si spostano, canali RGB sfalsati (aberrazione cromatica),
     inversioni, e — quando disponibile — un fotogramma passato che riaffiora a
-    strisce dentro quello presente (la "memoria" del nastro che sanguina)."""
+    strisce dentro quello presente (la "memoria" del nastro che sanguina).
+    Anche la primissima generazione (usura minima) deve mostrarsi chiaramente
+    diversa da Ikeda: la probabilità parte già alta e sale ulteriormente con l'uso."""
     if usura_level <= 0.0:
         return frame
     h, w = frame.shape[:2]
@@ -805,27 +807,31 @@ def apply_visual_degradation(frame, t, seed, usura_level, memory_frame=None):
     strip_h = max(1, h // n_strips)
     rng = np.random.RandomState(int((t * 97 + seed * 11) % (2**31)))
 
+    trigger_prob = min(0.75, 0.22 + 0.6 * usura_level)  # base visibile subito, cresce con l'uso
+    shift_frac = min(0.5, 0.15 + 0.4 * usura_level)     # spostamento minimo garantito
+    channel_shift_max = 20 + int(50 * usura_level)
+
     for s in range(n_strips):
         y0 = s * strip_h
         y1 = h if s == n_strips - 1 else y0 + strip_h
-        if rng.random() >= 0.4 * usura_level:
+        if rng.random() >= trigger_prob:
             continue
         effetto = rng.choice(["spostamento", "canale", "inversione", "memoria"])
 
         if effetto == "spostamento":
-            max_shift = int(w * 0.35 * usura_level) + 1
+            max_shift = int(w * shift_frac) + 1
             shift = rng.randint(-max_shift, max_shift + 1)
             out[y0:y1] = np.roll(out[y0:y1], shift, axis=1)
         elif effetto == "canale":
             c = rng.randint(0, 3)
-            cshift = rng.randint(6, 6 + int(40 * usura_level))
+            cshift = rng.randint(10, max(11, channel_shift_max))
             out[y0:y1, :, c] = np.roll(out[y0:y1, :, c], cshift, axis=1)
         elif effetto == "inversione":
             out[y0:y1] = 255 - out[y0:y1]
         elif effetto == "memoria" and memory_frame is not None:
             out[y0:y1] = memory_frame[y0:y1]
 
-    noise_amp = 10 * usura_level
+    noise_amp = 6 + 18 * usura_level  # grana visibile fin da subito, non solo ad usura alta
     noise = rng.normal(0, noise_amp, out.shape)
     out = np.clip(out.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
@@ -842,7 +848,7 @@ def render_frame_jeck(t, score, width=960, height=540, orientation="verticale",
                                num_lanes=num_lanes, palette=palette, band_colors=band_colors)
 
     memory_frame = None
-    if usura_level > 0.1:
+    if usura_level > 0.0:
         memory_delay = 0.4 + 1.5 * usura_level  # più usura, più "vecchio" il ricordo che riaffiora
         memory_frame = render_frame_ikeda(max(0.0, t - memory_delay), score, width=width, height=height,
                                            orientation=orientation, num_lanes=num_lanes,
@@ -1252,23 +1258,23 @@ with st.sidebar:
         if orientamento == "misto":
             st.caption("In modalità mista: bassi verticali (sostenuti), alti orizzontali (rapidi), "
                        "medi alternati nel tempo.")
-        num_lanes = st.slider("Numero di linee", 1, 24, 10)
+        num_lanes = st.slider("Numero di linee", 1, 24, 10, key="num_lanes_01")
         posizione_label = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
-                                    horizontal=True,
+                                    horizontal=True, key="posizione_01",
                                     help="Pan reale: segue la posizione stereo vera del colpo — se il mix è "
                                          "centrato/mono, le barre restano vicine al centro qualunque sia il "
                                          "numero di linee. Frequenza: ignora il pan, distribuisce sempre "
                                          "sull'intera larghezza (bassi a sinistra, alti a destra).")
         position_mode = "pan" if posizione_label == "Pan stereo reale" else "frequenza"
-        palette = st.selectbox("Palette colore", list(PALETTES.keys()))
+        palette = st.selectbox("Palette colore", list(PALETTES.keys()), key="palette_01")
 
         band_colors = None
         if palette == "Per banda (bassi/medi/alti)":
             st.caption("Un colore per ciascuna banda di frequenza (solo eventi audio; "
                        "le altre fonti restano grigio chiaro).")
-            c_bassi = st.color_picker("Bassi", "#EB2828")
-            c_medi = st.color_picker("Medi", "#FFAA00")
-            c_alti = st.color_picker("Alti", "#00C8FF")
+            c_bassi = st.color_picker("Bassi", "#EB2828", key="ikeda_bassi")
+            c_medi = st.color_picker("Medi", "#FFAA00", key="ikeda_medi")
+            c_alti = st.color_picker("Alti", "#00C8FF", key="ikeda_alti")
 
             def _hex_to_rgb(h):
                 h = h.lstrip("#")
@@ -1352,8 +1358,8 @@ with st.sidebar:
             st.rerun()
 
         st.markdown("---")
-        num_lanes = st.slider("Numero di linee", 1, 24, 10)
-        palette = st.selectbox("Palette colore", list(PALETTES.keys()))
+        num_lanes = st.slider("Numero di linee", 1, 24, 10, key="num_lanes_04")
+        palette = st.selectbox("Palette colore", list(PALETTES.keys()), key="palette_04")
         band_colors = None
         if palette == "Per banda (bassi/medi/alti)":
             c_bassi_j = st.color_picker("Bassi", "#EB2828", key="jeck_bassi")
