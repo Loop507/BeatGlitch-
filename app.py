@@ -6,13 +6,16 @@ sintesi sonora, dallo stesso dato condiviso.
 """
 import numpy as np
 import cv2
+import os
+import json
+import tempfile
 
 SR = 44100
 FPS = 30
 
 # Ogni modulo della serie BeatGlitch — Matrice Engine è dedicato a un riferimento
 # concettuale diverso. 01=Ikeda (rigore/automa cellulare), 02=Henke (separazione
-# macro/micro). 03/04 (Molnár/Jeck) arriveranno in seguito con lo stesso schema.
+# macro/micro), 03=Molnár (disordine controllato), 04=Jeck (usura con memoria).
 MODULES = {
     "01": {
         "nome": "Ikeda — Cellular Drift",
@@ -38,7 +41,42 @@ MODULES = {
         "quote": "La regola resta quasi sempre uguale. Quando si rompe, lo fa apposta.",
         "hashtag": "#griddeviation #controlleddisorder",
     },
+    "04": {
+        "nome": "Jeck — Usura con Memoria",
+        "effetto": "Tape Decay",
+        "processo": "Degrado Cumulativo Persistente",
+        "motore_tag": "usura con memoria",
+        "quote": "Non reagisce solo a ora. Ricorda ogni volta che e' stato suonato prima.",
+        "hashtag": "#tapedecay #memorydecay",
+    },
 }
+
+USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
+
+
+def load_usura_count():
+    """Numero totale di generazioni fatte finora col modulo Jeck. Persiste su disco
+    finché il container resta attivo — si azzera se Streamlit Cloud riavvia
+    l'istanza (redeploy, inattività prolungata): è un limite reale, non nascosto."""
+    try:
+        with open(USURA_STATE_PATH, "r") as f:
+            return int(json.load(f).get("count", 0))
+    except Exception:
+        return 0
+
+
+def save_usura_count(count):
+    try:
+        with open(USURA_STATE_PATH, "w") as f:
+            json.dump({"count": int(count)}, f)
+    except Exception:
+        pass  # se il filesystem non è scrivibile, la sessione prosegue senza persistenza
+
+
+def usura_level_from_count(count, saturation=50):
+    """0..1, satura dopo 'saturation' generazioni (il nastro non si consuma all'infinito)."""
+    return min(1.0, count / float(saturation))
+
 
 SOURCE_COLOR = {
     "ca":    (235, 235, 235),   # procedurale — bianco/grigio
@@ -753,6 +791,60 @@ def render_frame_molnar(t, score, width=960, height=540, orientation="verticale"
     return frame
 
 
+def apply_visual_degradation(frame, t, seed, usura_level):
+    """Rumore, dropout (bande che si azzerano) e jitter di tracciamento — crescono
+    con l'usura, come un nastro/vinile che si consuma sempre di più a ogni ascolto."""
+    if usura_level <= 0.0:
+        return frame
+    h, w = frame.shape[:2]
+    out = frame.astype(np.int16)
+
+    noise_amp = 16 * usura_level
+    rng = np.random.RandomState(int((t * 1000 + seed) % (2**31)))
+    noise = rng.normal(0, noise_amp, out.shape)
+    out = np.clip(out + noise, 0, 255)
+
+    rng2 = np.random.RandomState(int((t * 37 + seed * 7) % (2**31)))
+    n_bands = int(1 + 5 * usura_level)
+    for _ in range(n_bands):
+        if rng2.random() < 0.18 * usura_level:
+            y0 = rng2.randint(0, h)
+            band_h = rng2.randint(1, max(2, int(h * 0.03)))
+            out[y0:y0 + band_h, :] = out[y0:y0 + band_h, :] * 0.12
+
+    if usura_level > 0.12:
+        rng3 = np.random.RandomState(int((t * 53 + seed * 3) % (2**31)))
+        n_jitter = int(h * 0.02 * usura_level)
+        for _ in range(n_jitter):
+            ry = rng3.randint(0, h)
+            shift = rng3.randint(-int(8 * usura_level) - 1, int(8 * usura_level) + 2)
+            out[ry] = np.roll(out[ry], shift, axis=0)
+
+    return out.astype(np.uint8)
+
+
+def render_frame_jeck(t, score, width=960, height=540, orientation="verticale",
+                       num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                       usura_level=0.0):
+    """Riusa la resa 'pulita' di Ikeda come base — lo stesso dato, la stessa
+    grammatica visiva — e la degrada in base a quante volte è già stata suonata."""
+    base = render_frame_ikeda(t, score, width=width, height=height, orientation=orientation,
+                               num_lanes=num_lanes, palette=palette, band_colors=band_colors)
+
+    if usura_level > 0.05:
+        ghost_delay = 0.18
+        ghost = render_frame_ikeda(max(0.0, t - ghost_delay), score, width=width, height=height,
+                                    orientation=orientation, num_lanes=num_lanes,
+                                    palette=palette, band_colors=band_colors)
+        ghost_opacity = 0.35 * usura_level
+        base = np.clip(
+            base.astype(np.float32) * (1 - ghost_opacity) + ghost.astype(np.float32) * ghost_opacity,
+            0, 255
+        ).astype(np.uint8)
+
+    return apply_visual_degradation(base, t, score["seed"], usura_level)
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -798,6 +890,55 @@ def synthesize_audio_ikeda(score, sr=SR):
 
     stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
     return stereo
+
+
+def apply_audio_degradation(stereo, sr, seed, usura_level):
+    """Wow&flutter (velocità di lettura instabile), crackle, fruscio di fondo e
+    micro-cadute di segnale — crescono con l'usura, come un nastro consumato."""
+    if usura_level <= 0.0:
+        return stereo
+    N = stereo.shape[1]
+    rng = np.random.RandomState(int(seed) % (2**31))
+
+    # wow & flutter: la velocità di lettura oscilla lentamente (tipico di nastro/vinile)
+    flutter_depth = 0.006 * usura_level
+    lfo_freq = 0.7
+    t_ax = np.arange(N) / sr
+    speed_mod = 1.0 + flutter_depth * np.sin(2 * np.pi * lfo_freq * t_ax)
+    warped_idx = np.clip(np.cumsum(speed_mod) - 1, 0, N - 1).astype(int)
+    out_l = stereo[0][warped_idx].copy()
+    out_r = stereo[1][warped_idx].copy()
+
+    # crackle: click sparsi (polvere/graffi)
+    n_clicks = int(N * 0.00004 * usura_level * 50)
+    for _ in range(n_clicks):
+        pos = rng.randint(0, N)
+        amp = rng.uniform(0.3, 0.9) * (1 if rng.random() < 0.5 else -1)
+        out_l[pos] = np.clip(out_l[pos] + amp, -1, 1)
+        out_r[pos] = np.clip(out_r[pos] + amp, -1, 1)
+
+    # fruscio di fondo costante
+    hiss_amp = 0.018 * usura_level
+    hiss = rng.normal(0, hiss_amp, N)
+    out_l = out_l + hiss
+    out_r = out_r + hiss
+
+    # micro-cadute di segnale (dropout)
+    seg_len = max(1, int(0.01 * sr))
+    dropout_prob = 0.001 * usura_level
+    for start in range(0, N, seg_len):
+        if rng.random() < dropout_prob:
+            end = min(N, start + seg_len)
+            out_l[start:end] *= 0.1
+            out_r[start:end] *= 0.1
+
+    return np.clip(np.stack([out_l, out_r]), -1.0, 1.0)
+
+
+def synthesize_audio_jeck(score, sr=SR, usura_level=0.0):
+    """Riusa la sintesi 'pulita' di Ikeda come base, poi la consuma progressivamente."""
+    base = synthesize_audio_ikeda(score, sr=sr)
+    return apply_audio_degradation(base, sr, score["seed"], usura_level)
 
 
 def synthesize_audio_henke(score, sr=SR):
@@ -963,6 +1104,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Macro Block Segmentation")
     if module_id == "03":
         analisi.append("Grid Deviation Detection")
+    if module_id == "04":
+        analisi.append("Tape Decay Tracking")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -994,6 +1137,9 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         n_dev_audio = sum(1 for e in score["deviation_events"] if e["source"] == "audio")
         righe.append(f"* Deviazioni: {n_dev} totali ({n_dev_audio} da colpi audio forti, "
                       f"{n_dev - n_dev_audio} procedurali)")
+    if module_id == "04":
+        righe.append(f"* Riproduzioni finora: {params.get('usura_count', '?')}")
+        righe.append(f"* Livello usura: {params.get('usura_level', 0)*100:.0f}%")
     righe.append(f"* Colonna sonora: {params['audio_mode']}")
     righe.append(f"* Eventi totali: {len(score['events'])}")
     righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
@@ -1019,7 +1165,7 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
 
 
 
-import os, json, tempfile, base64
+import base64
 from datetime import datetime
 import streamlit as st
 try:
@@ -1042,8 +1188,10 @@ module_id = modulo_label.split(" — ")[0]
 MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {module_id}"
 MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
-RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar}
-SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar}
+RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
+              "04": render_frame_jeck}
+SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
+             "04": synthesize_audio_jeck}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -1053,6 +1201,10 @@ if module_id == "02":
 elif module_id == "03":
     st.caption("Modulo Molnár: una griglia rigida resta quasi sempre identica. Devia "
                "solo sui colpi audio davvero forti (o raramente da sé, senza audio).")
+elif module_id == "04":
+    _usura_count_preview = load_usura_count()
+    st.caption(f"Modulo Jeck: questa istanza ha già generato {_usura_count_preview} volte. "
+               f"Più cresce il numero, più il segnale è consumato — non si azzera da sé.")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -1142,7 +1294,7 @@ with st.sidebar:
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         position_mode = "pan"
         show_source_legend = False
-    else:
+    elif module_id == "03":
         # Modulo Molnár: griglia rigida, quasi sempre uniforme — densità, colori
         # per banda e ritmo delle deviazioni sono personalizzabili
         st.caption("La griglia resta identica quasi sempre. Il colore della deviazione "
@@ -1173,6 +1325,31 @@ with st.sidebar:
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
         position_mode = "pan"
         show_source_legend = False
+    else:
+        # Modulo Jeck: riusa lo stesso linguaggio visivo/sonoro di Ikeda, ma lo
+        # consuma in base a quante volte è già stato generato — persistente su disco
+        st.caption("Il degrado cresce col numero di generazioni fatte finora su questa "
+                   "istanza (satura dopo 50). Non c'è modo di 'pulirlo' se non azzerarlo.")
+        _usura_count = load_usura_count()
+        _usura_level_reale = usura_level_from_count(_usura_count)
+        st.metric("Riproduzioni finora", _usura_count, help="Persistente finché il container resta attivo.")
+        st.progress(_usura_level_reale, text=f"Usura: {_usura_level_reale*100:.0f}%")
+
+        preview_override = st.checkbox("Anteprima: forza un livello di usura diverso", value=False)
+        if preview_override:
+            usura_level_effettivo = st.slider("Livello usura (anteprima)", 0.0, 1.0, _usura_level_reale, step=0.05)
+        else:
+            usura_level_effettivo = _usura_level_reale
+
+        if st.button("🔄 Azzera usura (irreversibile)"):
+            save_usura_count(0)
+            st.rerun()
+
+        orientamento, num_lanes, palette, band_colors = "verticale", 10, "Multicolore (per fonte)", None
+        grid_cols, accent_color = 10, (235, 40, 60)
+        position_mode = "pan"
+        deviation_sensitivity, deviation_min_gap = 0.6, 1.0
+        show_source_legend = True
 
 # ------------------------------------------------------------
 # ESTRAZIONE — ogni input presente alimenta un ruolo diverso
@@ -1257,7 +1434,8 @@ if st.button("🚀 GENERA", use_container_width=True):
 
         st.write("Costruzione colonna sonora finale...")
         N = int(score["duration"] * SR)
-        generated = synthesize_audio_fn(score, sr=SR)  # shape (2, N)
+        synth_kwargs = {"usura_level": usura_level_effettivo} if module_id == "04" else {}
+        generated = synthesize_audio_fn(score, sr=SR, **synth_kwargs)  # shape (2, N)
 
         if audio_mode == "Originale (file caricato)" and audio_raw is not None:
             final_audio = fit_audio_length(audio_raw, N)
@@ -1278,6 +1456,8 @@ if st.button("🚀 GENERA", use_container_width=True):
             extra_kwargs = {"grid_cols": grid_cols, "accent_color": accent_color}
         elif module_id == "01":
             extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "04":
+            extra_kwargs = {"usura_level": usura_level_effettivo}
 
         def make_frame(t):
             return render_frame_fn(t, score, width=export_w, height=export_h,
@@ -1293,6 +1473,10 @@ if st.button("🚀 GENERA", use_container_width=True):
         clip.write_videofile(out_path, codec="libx264", audio_codec="aac",
                               fps=FPS, logger=None)
 
+        # l'usura avanza solo con generazioni reali, non con l'anteprima forzata
+        if module_id == "04" and not preview_override:
+            save_usura_count(_usura_count + 1)
+
         st.write("Generazione report...")
         ts_compact = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_filename = f"{MODULE_FILENAME_BASE}_{ts_compact}"
@@ -1300,6 +1484,9 @@ if st.button("🚀 GENERA", use_container_width=True):
             "seed": int(seed), "rule": rule, "duration": score["duration"],
             "resolution": f"{export_w}x{export_h}", "audio_mode": audio_mode,
             "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "usura_count": (_usura_count + 1) if module_id == "04" and not preview_override else
+                           (_usura_count if module_id == "04" else None),
+            "usura_level": usura_level_effettivo if module_id == "04" else None,
         }
         report_text = generate_text_report(report_params, score, module_id=module_id)
 
