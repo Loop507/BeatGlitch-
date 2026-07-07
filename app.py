@@ -791,58 +791,64 @@ def render_frame_molnar(t, score, width=960, height=540, orientation="verticale"
     return frame
 
 
-def apply_visual_degradation(frame, t, seed, usura_level):
-    """Rumore, dropout (bande che si azzerano) e jitter di tracciamento — crescono
-    con l'usura, come un nastro/vinile che si consuma sempre di più a ogni ascolto."""
+def apply_visual_degradation(frame, t, seed, usura_level, memory_frame=None):
+    """Strisce DISTRUTTE (Jeck): non un velo di rumore sopra l'immagine pulita, ma
+    tagli orizzontali che si spostano, canali RGB sfalsati (aberrazione cromatica),
+    inversioni, e — quando disponibile — un fotogramma passato che riaffiora a
+    strisce dentro quello presente (la "memoria" del nastro che sanguina)."""
     if usura_level <= 0.0:
         return frame
     h, w = frame.shape[:2]
-    out = frame.astype(np.int16)
+    out = frame.copy()
 
-    noise_amp = 16 * usura_level
-    rng = np.random.RandomState(int((t * 1000 + seed) % (2**31)))
+    n_strips = 16
+    strip_h = max(1, h // n_strips)
+    rng = np.random.RandomState(int((t * 97 + seed * 11) % (2**31)))
+
+    for s in range(n_strips):
+        y0 = s * strip_h
+        y1 = h if s == n_strips - 1 else y0 + strip_h
+        if rng.random() >= 0.4 * usura_level:
+            continue
+        effetto = rng.choice(["spostamento", "canale", "inversione", "memoria"])
+
+        if effetto == "spostamento":
+            max_shift = int(w * 0.35 * usura_level) + 1
+            shift = rng.randint(-max_shift, max_shift + 1)
+            out[y0:y1] = np.roll(out[y0:y1], shift, axis=1)
+        elif effetto == "canale":
+            c = rng.randint(0, 3)
+            cshift = rng.randint(6, 6 + int(40 * usura_level))
+            out[y0:y1, :, c] = np.roll(out[y0:y1, :, c], cshift, axis=1)
+        elif effetto == "inversione":
+            out[y0:y1] = 255 - out[y0:y1]
+        elif effetto == "memoria" and memory_frame is not None:
+            out[y0:y1] = memory_frame[y0:y1]
+
+    noise_amp = 10 * usura_level
     noise = rng.normal(0, noise_amp, out.shape)
-    out = np.clip(out + noise, 0, 255)
+    out = np.clip(out.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    rng2 = np.random.RandomState(int((t * 37 + seed * 7) % (2**31)))
-    n_bands = int(1 + 5 * usura_level)
-    for _ in range(n_bands):
-        if rng2.random() < 0.18 * usura_level:
-            y0 = rng2.randint(0, h)
-            band_h = rng2.randint(1, max(2, int(h * 0.03)))
-            out[y0:y0 + band_h, :] = out[y0:y0 + band_h, :] * 0.12
-
-    if usura_level > 0.12:
-        rng3 = np.random.RandomState(int((t * 53 + seed * 3) % (2**31)))
-        n_jitter = int(h * 0.02 * usura_level)
-        for _ in range(n_jitter):
-            ry = rng3.randint(0, h)
-            shift = rng3.randint(-int(8 * usura_level) - 1, int(8 * usura_level) + 2)
-            out[ry] = np.roll(out[ry], shift, axis=0)
-
-    return out.astype(np.uint8)
+    return out
 
 
 def render_frame_jeck(t, score, width=960, height=540, orientation="verticale",
                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
                        usura_level=0.0):
     """Riusa la resa 'pulita' di Ikeda come base — lo stesso dato, la stessa
-    grammatica visiva — e la degrada in base a quante volte è già stata suonata."""
+    grammatica visiva — e la distrugge in strisce in base a quante volte è già
+    stata suonata: più usura, più tagli, spostamenti e memoria che riaffiora."""
     base = render_frame_ikeda(t, score, width=width, height=height, orientation=orientation,
                                num_lanes=num_lanes, palette=palette, band_colors=band_colors)
 
-    if usura_level > 0.05:
-        ghost_delay = 0.18
-        ghost = render_frame_ikeda(max(0.0, t - ghost_delay), score, width=width, height=height,
-                                    orientation=orientation, num_lanes=num_lanes,
-                                    palette=palette, band_colors=band_colors)
-        ghost_opacity = 0.35 * usura_level
-        base = np.clip(
-            base.astype(np.float32) * (1 - ghost_opacity) + ghost.astype(np.float32) * ghost_opacity,
-            0, 255
-        ).astype(np.uint8)
+    memory_frame = None
+    if usura_level > 0.1:
+        memory_delay = 0.4 + 1.5 * usura_level  # più usura, più "vecchio" il ricordo che riaffiora
+        memory_frame = render_frame_ikeda(max(0.0, t - memory_delay), score, width=width, height=height,
+                                           orientation=orientation, num_lanes=num_lanes,
+                                           palette=palette, band_colors=band_colors)
 
-    return apply_visual_degradation(base, t, score["seed"], usura_level)
+    return apply_visual_degradation(base, t, score["seed"], usura_level, memory_frame=memory_frame)
 
 
 # ============================================================
@@ -1345,11 +1351,27 @@ with st.sidebar:
             save_usura_count(0)
             st.rerun()
 
-        orientamento, num_lanes, palette, band_colors = "verticale", 10, "Multicolore (per fonte)", None
+        st.markdown("---")
+        num_lanes = st.slider("Numero di linee", 1, 24, 10)
+        palette = st.selectbox("Palette colore", list(PALETTES.keys()))
+        band_colors = None
+        if palette == "Per banda (bassi/medi/alti)":
+            c_bassi_j = st.color_picker("Bassi", "#EB2828", key="jeck_bassi")
+            c_medi_j = st.color_picker("Medi", "#FFAA00", key="jeck_medi")
+            c_alti_j = st.color_picker("Alti", "#00C8FF", key="jeck_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_j), "mid": _hex_to_rgb(c_medi_j),
+                            "treble": _hex_to_rgb(c_alti_j)}
+
+        orientamento = "verticale"
         grid_cols, accent_color = 10, (235, 40, 60)
         position_mode = "pan"
         deviation_sensitivity, deviation_min_gap = 0.6, 1.0
-        show_source_legend = True
+        show_source_legend = (palette == "Multicolore (per fonte)")
 
 # ------------------------------------------------------------
 # ESTRAZIONE — ogni input presente alimenta un ruolo diverso
