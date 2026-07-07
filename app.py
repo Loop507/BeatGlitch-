@@ -1266,10 +1266,11 @@ with st.sidebar:
                                          "numero di linee. Frequenza: ignora il pan, distribuisce sempre "
                                          "sull'intera larghezza (bassi a sinistra, alti a destra).")
         position_mode = "pan" if posizione_label == "Pan stereo reale" else "frequenza"
-        palette = st.selectbox("Palette colore", list(PALETTES.keys()), key="palette_01")
 
+        usa_banda_01 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_01")
         band_colors = None
-        if palette == "Per banda (bassi/medi/alti)":
+        if usa_banda_01:
+            palette = "Per banda (bassi/medi/alti)"
             st.caption("Un colore per ciascuna banda di frequenza (solo eventi audio; "
                        "le altre fonti restano grigio chiaro).")
             c_bassi = st.color_picker("Bassi", "#EB2828", key="ikeda_bassi")
@@ -1282,6 +1283,9 @@ with st.sidebar:
 
             band_colors = {"bass": _hex_to_rgb(c_bassi), "mid": _hex_to_rgb(c_medi),
                             "treble": _hex_to_rgb(c_alti)}
+        else:
+            palette_options = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options, key="palette_01")
 
         st.markdown("---")
         show_source_legend = st.checkbox("Mostra legenda colori fonte", value=True,
@@ -1359,9 +1363,11 @@ with st.sidebar:
 
         st.markdown("---")
         num_lanes = st.slider("Numero di linee", 1, 24, 10, key="num_lanes_04")
-        palette = st.selectbox("Palette colore", list(PALETTES.keys()), key="palette_04")
+
+        usa_banda_04 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_04")
         band_colors = None
-        if palette == "Per banda (bassi/medi/alti)":
+        if usa_banda_04:
+            palette = "Per banda (bassi/medi/alti)"
             c_bassi_j = st.color_picker("Bassi", "#EB2828", key="jeck_bassi")
             c_medi_j = st.color_picker("Medi", "#FFAA00", key="jeck_medi")
             c_alti_j = st.color_picker("Alti", "#00C8FF", key="jeck_alti")
@@ -1372,6 +1378,9 @@ with st.sidebar:
 
             band_colors = {"bass": _hex_to_rgb(c_bassi_j), "mid": _hex_to_rgb(c_medi_j),
                             "treble": _hex_to_rgb(c_alti_j)}
+        else:
+            palette_options_j = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_j, key="palette_04")
 
         orientamento = "verticale"
         grid_cols, accent_color = 10, (235, 40, 60)
