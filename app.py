@@ -94,7 +94,7 @@ PALETTES = {
     "Multicolore (per fonte)": None,
     "Rosso":   (235, 40, 40),
     "Blu":     (60, 140, 255),
-    "Bianco":  (240, 240, 240),
+    "Bianco":  (255, 255, 255),
     "Ambra":   (255, 170, 0),
     "Verde":   (60, 220, 120),
     "Per banda (bassi/medi/alti)": "BAND",
@@ -1514,8 +1514,12 @@ if st.button("🚀 GENERA", use_container_width=True):
         clip = clip.with_audio(audio_clip) if hasattr(clip, "with_audio") else clip.set_audio(audio_clip)
 
         out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-        clip.write_videofile(out_path, codec="libx264", audio_codec="aac",
-                              fps=FPS, logger=None)
+        clip.write_videofile(
+            out_path, codec="libx264", audio_codec="aac", fps=FPS, logger=None,
+            ffmpeg_params=["-pix_fmt", "yuv420p", "-color_range", "pc",
+                           "-colorspace", "bt709", "-color_primaries", "bt709",
+                           "-color_trc", "bt709"]
+        )
 
         # l'usura avanza solo con generazioni reali, non con l'anteprima forzata
         if module_id == "04" and not preview_override:
