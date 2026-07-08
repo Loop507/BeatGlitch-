@@ -73,9 +73,12 @@ def save_usura_count(count):
         pass  # se il filesystem non è scrivibile, la sessione prosegue senza persistenza
 
 
-def usura_level_from_count(count, saturation=50):
-    """0..1, satura dopo 'saturation' generazioni (il nastro non si consuma all'infinito)."""
-    return min(1.0, count / float(saturation))
+def usura_level_from_count(count, saturation=50, baseline=2.0):
+    """0..1, satura dopo 'saturation' generazioni. Un piccolo scarto di base (baseline)
+    fa sì che anche la primissima generazione (count=0) mostri già un accenno di
+    degrado — altrimenti a zero il modulo tornerebbe identico a Ikeda puro, confondendo
+    chi lo prova per la prima volta prima ancora di sapere che l'usura si accumula."""
+    return min(1.0, (count + baseline) / float(saturation))
 
 
 SOURCE_COLOR = {
