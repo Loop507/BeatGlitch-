@@ -1363,6 +1363,11 @@ with st.sidebar:
 
         st.markdown("---")
         num_lanes = st.slider("Numero di linee", 1, 24, 10, key="num_lanes_04")
+        orientamento_label_04 = st.radio("Orientamento linee", ["Verticali", "Orizzontali", "Verticali + Orizzontali"],
+                                          horizontal=True, key="orientamento_04")
+        ORIENTAMENTI_04 = {"Verticali": "verticale", "Orizzontali": "orizzontale",
+                            "Verticali + Orizzontali": "misto"}
+        orientamento = ORIENTAMENTI_04[orientamento_label_04]
 
         usa_banda_04 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_04")
         band_colors = None
@@ -1382,7 +1387,6 @@ with st.sidebar:
             palette_options_j = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_j, key="palette_04")
 
-        orientamento = "verticale"
         grid_cols, accent_color = 10, (235, 40, 60)
         position_mode = "pan"
         deviation_sensitivity, deviation_min_gap = 0.6, 1.0
