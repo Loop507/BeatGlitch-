@@ -57,6 +57,14 @@ MODULES = {
         "quote": "Niente griglia, niente cella. Solo traiettorie che si aprono come un ventaglio.",
         "hashtag": "#stochasticfield #generativelines",
     },
+    "06": {
+        "nome": "Matrice 06 — Tessuto Vivente",
+        "effetto": "Living Automaton Bloom",
+        "processo": "Automa Cellulare 2D Continuo + Fioriture Granulari",
+        "motore_tag": "matrice che muta da sé",
+        "quote": "Non reagisce e basta: cresce e si dirada anche quando nessuno la tocca.",
+        "hashtag": "#cellularautomaton #generativetexture",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -531,6 +539,11 @@ def build_score(duration, seed, rule=30,
         strong_threshold=deviation_strong_threshold, min_gap=deviation_min_gap,
     )
 
+    # campo automa cellulare 2D dedicato (modulo 06): non serve a generare eventi,
+    # è esso stesso il "tessuto" visivo/sonoro che scorre e muta nel tempo
+    automaton_steps = max(30, int(duration * 10))
+    automaton_field = cellular_automaton(rule, width=140, steps=automaton_steps, seed=effective_seed + 909)
+
     return {
         "duration": duration,
         "seed": effective_seed,
@@ -541,6 +554,7 @@ def build_score(duration, seed, rule=30,
         "macro_envelope": macro,
         "silence_envelope": silence_envelope,
         "micro_texture": texture,
+        "automaton_field": automaton_field,
     }
 
 
@@ -940,6 +954,80 @@ def render_frame_stocastico(t, score, width=960, height=540, orientation="vertic
     return frame
 
 
+def render_frame_automaton(t, score, width=960, height=540, orientation="verticale",
+                            num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                            position_mode="pan"):
+    """Matrice 06: qui non è un evento a disegnare una forma su uno sfondo statico —
+    è la MATRICE STESSA a vivere e mutare nel tempo. Un automa cellulare 2D dedicato
+    scorre come tessuto organico continuo sullo sfondo (mai rigido, mai a celle
+    separate). Gli eventi audio non tracciano barre né linee ma fioriture di colore
+    morbide (gradienti radiali concentrici) che sbocciano sopra il tessuto — nessuna
+    forma geometrica netta, nessuna griglia: la texture di fondo è essa stessa il
+    contenuto generativo, non solo una cornice per gli eventi."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+
+    field = score["automaton_field"]
+    steps, cols = field.shape
+    row_idx = min(steps - 1, int((t / duration) * steps))
+    window = 90  # "storia" visibile dell'automa, come un tessuto che scorre nel tempo
+    start_row = max(0, row_idx - window + 1)
+    strip = field[start_row:row_idx + 1]
+    if strip.shape[0] < window:
+        pad = np.zeros((window - strip.shape[0], cols), dtype=field.dtype)
+        strip = np.vstack([pad, strip])
+
+    tex_img = cv2.resize((strip.astype(np.float32) * 255.0), (width, height),
+                          interpolation=cv2.INTER_LINEAR)
+    tex_img = cv2.GaussianBlur(tex_img, (0, 0), sigmaX=3)
+
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / duration) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+    tex_level = 14 + macro_v * 22
+    tex_gray = np.clip(tex_img / 255.0 * tex_level, 0, 255).astype(np.uint8)
+    frame[:, :, 0] = tex_gray
+    frame[:, :, 1] = tex_gray
+    frame[:, :, 2] = tex_gray
+
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / duration) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame
+
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    num_lanes = max(1, int(num_lanes))
+
+    for e in active:
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        color = get_event_color(e, palette, band_colors)
+        fade = 1.0 - prog * 0.5
+
+        lane_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+        band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
+            (1.0 if e["source"] == "ca" else 1.6)
+        event_orientation = _event_orientation(e, orientation)
+
+        radius = max(4, int((22 + 55 * e["vel"]) * band_thickness * (1 - prog * 0.3) *
+                             (0.4 + 0.6 * (num_lanes / 10.0))))
+
+        if event_orientation == "verticale":
+            cx, cy = int(lane_frac * width), height // 2
+        else:
+            cx, cy = width // 2, int(lane_frac * height)
+
+        n_rings = 6
+        for ring in range(n_rings, 0, -1):
+            r = max(1, int(radius * ring / n_rings))
+            alpha = fade * (0.15 + 0.85 * (1 - ring / n_rings))
+            c = tuple(int(ch * alpha) for ch in color)
+            cv2.circle(frame, (cx, cy), r, c, -1, lineType=cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -1213,6 +1301,73 @@ def synthesize_audio_stocastico(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_automaton(score, sr=SR):
+    """Matrice 06: nessuna tonalità fissa scandita a evento — una NUVOLA GRANULARE
+    stocastica la cui densità segue la densità viva dell'automa cellulare in
+    quell'istante (esattamente come il tessuto visivo: cresce e si dirada da sé,
+    non solo in reazione a un colpo). Gli eventi reali si sovrappongono come
+    impulsi brevi misti tono/rumore, per restare comunque sincronizzati con la
+    fioritura visiva."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
+
+    field = score["automaton_field"]
+    steps, cols = field.shape
+    density_per_step = field.mean(axis=1)
+    rng = np.random.RandomState(score["seed"] + 909)
+
+    grain_dur = 0.02
+    grain_n = max(2, int(grain_dur * sr))
+    win = np.hanning(grain_n)
+    t_ax = np.arange(grain_n) / sr
+    step_dur = duration / steps
+
+    for i in range(steps):
+        dens = float(density_per_step[i])
+        n_grains = int(1 + dens * 14)
+        t0 = i * step_dur
+        for _ in range(n_grains):
+            gt = t0 + rng.uniform(0, step_dur)
+            start = int(gt * sr)
+            end = min(N, start + grain_n)
+            if end <= start:
+                continue
+            seg_len = end - start
+            freq = rng.uniform(180, 3200) * (0.5 + dens)
+            wave = np.sin(2 * np.pi * freq * t_ax[:seg_len]) * win[:seg_len] * (0.05 + 0.12 * dens)
+            pan = rng.uniform(-0.8, 0.8)
+            gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+            gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+            out_l[start:end] += wave * gain_l
+            out_r[start:end] += wave * gain_r
+
+    # eventi reali: impulsi brevi misti tono/rumore, per la sincronia audio/video
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.04 * sr), int(e["dur"] * sr * 0.6))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 220.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        noise = rng.normal(0, 1, seg_len)
+        tone = np.sin(2 * np.pi * freq * seg_t)
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = (0.6 * tone + 0.4 * noise) * env_local * e["vel"] * 0.35
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -1261,6 +1416,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Tape Decay Tracking")
     if module_id == "05":
         analisi.append("Poisson Point Field / Divergent Line Sweep")
+    if module_id == "06":
+        analisi.append("2D Cellular Automaton Field / Granular Density Synthesis")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -1344,9 +1501,9 @@ MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {module_id}"
 MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
-              "04": render_frame_jeck, "05": render_frame_stocastico}
+              "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
-             "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico}
+             "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -1364,6 +1521,10 @@ elif module_id == "05":
     st.caption("Modulo 05: nessuna griglia e nessuna cella. Ogni evento apre un fascio "
                "di linee divergenti che attraversa l'intero fotogramma, su un fondo di "
                "pulviscolo stocastico.")
+elif module_id == "06":
+    st.caption("Modulo 06: un automa cellulare 2D scorre come tessuto continuo sullo "
+               "sfondo, mutando anche senza input. Gli eventi sbocciano sopra come "
+               "fioriture morbide di colore, non barre né linee.")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -1538,7 +1699,7 @@ with st.sidebar:
         position_mode = "pan"
         deviation_sensitivity, deviation_min_gap = 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "05":
         # Modulo 05: campo stocastico continuo — niente griglia, niente celle.
         # Riusa lo stesso sistema di colori/comandi degli altri moduli, ma la resa
         # visiva è fasci di linee divergenti su un fondo di pulviscolo.
@@ -1572,6 +1733,43 @@ with st.sidebar:
         else:
             palette_options_5 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_5, key="palette_05")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 06: il tessuto di fondo (automa cellulare 2D) muta da sé nel tempo,
+        # indipendentemente dagli eventi — gli eventi aggiungono solo le fioriture
+        # di colore sopra la texture continua.
+        st.caption("Il tessuto di fondo cresce e si dirada da solo, anche in assenza "
+                   "di eventi. 'Numero di linee' qui regola la scala delle fioriture "
+                   "di colore rispetto al tessuto.")
+        orientamento_label_06 = st.radio("Orientamento fioriture", ["Verticali", "Orizzontali", "Verticali + Orizzontali"],
+                                          horizontal=True, key="orientamento_06")
+        ORIENTAMENTI_06 = {"Verticali": "verticale", "Orizzontali": "orizzontale",
+                            "Verticali + Orizzontali": "misto"}
+        orientamento = ORIENTAMENTI_06[orientamento_label_06]
+        num_lanes = st.slider("Numero di linee (scala fioriture)", 1, 24, 10, key="num_lanes_06")
+        posizione_label_06 = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_06")
+        position_mode = "pan" if posizione_label_06 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_06 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_06")
+        band_colors = None
+        if usa_banda_06:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_6 = st.color_picker("Bassi", "#EB2828", key="auto_bassi")
+            c_medi_6 = st.color_picker("Medi", "#FFAA00", key="auto_medi")
+            c_alti_6 = st.color_picker("Alti", "#00C8FF", key="auto_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_6), "mid": _hex_to_rgb(c_medi_6),
+                            "treble": _hex_to_rgb(c_alti_6)}
+        else:
+            palette_options_6 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_6, key="palette_06")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
@@ -1684,6 +1882,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         elif module_id == "04":
             extra_kwargs = {"usura_level": usura_level_effettivo}
         elif module_id == "05":
+            extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "06":
             extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
