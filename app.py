@@ -18,7 +18,7 @@ FPS = 30
 # macro/micro), 03=Molnár (disordine controllato), 04=Jeck (usura con memoria).
 MODULES = {
     "01": {
-        "nome": "Ikeda — Cellular Drift",
+        "nome": "Matrice 01 — Cellular Drift",
         "effetto": "Cellular Drift",
         "processo": "Matrice Condivisa",
         "motore_tag": "generativo condiviso",
@@ -26,7 +26,7 @@ MODULES = {
         "hashtag": "#cellularautomaton #computationalminimalism",
     },
     "02": {
-        "nome": "Henke — Macro/Micro Split",
+        "nome": "Matrice 02 — Macro/Micro Split",
         "effetto": "Macro Block Drift",
         "processo": "Struttura a Blocchi + Grana Micro",
         "motore_tag": "macro/micro separati",
@@ -34,7 +34,7 @@ MODULES = {
         "hashtag": "#macromicron #granularsynthesis",
     },
     "03": {
-        "nome": "Molnár — Disordine Controllato",
+        "nome": "Matrice 03 — Disordine Controllato",
         "effetto": "Grid Deviation",
         "processo": "Griglia Rigida + Deviazioni Rare",
         "motore_tag": "griglia + eccezioni rare",
@@ -42,12 +42,20 @@ MODULES = {
         "hashtag": "#griddeviation #controlleddisorder",
     },
     "04": {
-        "nome": "Jeck — Usura con Memoria",
+        "nome": "Matrice 04 — Usura con Memoria",
         "effetto": "Tape Decay",
         "processo": "Degrado Cumulativo Persistente",
         "motore_tag": "usura con memoria",
         "quote": "Non reagisce solo a ora. Ricorda ogni volta che e' stato suonato prima.",
         "hashtag": "#tapedecay #memorydecay",
+    },
+    "05": {
+        "nome": "Matrice 05 — Campi Stocastici",
+        "effetto": "Stochastic Field Sweep",
+        "processo": "Fasci di Linee Divergenti + Pulviscolo Stocastico",
+        "motore_tag": "campo continuo stocastico",
+        "quote": "Niente griglia, niente cella. Solo traiettorie che si aprono come un ventaglio.",
+        "hashtag": "#stochasticfield #generativelines",
     },
 }
 
@@ -860,6 +868,78 @@ def render_frame_jeck(t, score, width=960, height=540, orientation="verticale",
     return apply_visual_degradation(base, t, score["seed"], usura_level, memory_frame=memory_frame)
 
 
+def render_frame_stocastico(t, score, width=960, height=540, orientation="verticale",
+                             num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                             position_mode="pan"):
+    """Matrice 05: campo continuo stocastico. Niente griglia, niente celle
+    rettangolari: ogni evento genera un FASCIO di linee diagonali che attraversa
+    l'intero fotogramma da un bordo all'altro, con partenza e arrivo che divergono
+    in modo casuale (le linee non sono mai parallele, si aprono come un ventaglio).
+    Lo sfondo è un pulviscolo di punti sparsi a densità variabile, non una griglia.
+    Stesso sistema dati/colori delle altre matrici (get_event_color, band_colors,
+    palette, gate silenzio), ma grammatica visiva radicalmente diversa: continua
+    e obliqua invece che discreta e ortogonale."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / max(score["duration"], 1e-6)) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+
+    # pulviscolo di fondo: punti sparsi con seed legato al tempo (non una griglia fissa)
+    rng_bg = np.random.RandomState(int((t * 30) % (2 ** 31)))
+    n_bg_points = int(40 + macro_v * 90)
+    bg_alpha = int(10 + macro_v * 14)
+    xs = rng_bg.uniform(0, width - 1, n_bg_points)
+    ys = rng_bg.uniform(0, height - 1, n_bg_points)
+    for x, y in zip(xs.astype(int), ys.astype(int)):
+        frame[y, x] = (bg_alpha, bg_alpha, bg_alpha)
+
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / max(score["duration"], 1e-6)) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame
+
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    num_lanes = max(1, int(num_lanes))
+
+    for e in active:
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        color = get_event_color(e, palette, band_colors)
+        fade = 1.0 - prog * 0.6
+
+        seed_e = int((e["t"] * 1000) % (2 ** 31))
+        rng_e = np.random.RandomState(seed_e)
+
+        lane_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+        band_thickness = BAND_PARAMS[e["band"]]["thickness"] if "band" in e else \
+            (1.0 if e["source"] == "ca" else 1.6)
+
+        # numero di linee del fascio e dispersione: proporzionali a num_lanes/intensità
+        n_lines = max(2, int(num_lanes * (0.25 + 0.65 * e["vel"])))
+        spread_start = 0.05 + 0.08 * e["vel"]
+        spread_end = spread_start * (1.8 + prog)  # il fascio diverge nel tempo
+
+        event_orientation = _event_orientation(e, orientation)
+        thickness = max(1, int(round(1 + band_thickness)))
+        c = tuple(int(ch * fade) for ch in color)
+
+        for _ in range(n_lines):
+            start_frac = min(0.999, max(0.0, lane_frac + rng_e.uniform(-spread_start, spread_start)))
+            end_frac = min(0.999, max(0.0, lane_frac + rng_e.uniform(-spread_end, spread_end)))
+
+            if event_orientation == "verticale":
+                x0, x1 = int(start_frac * width), int(end_frac * width)
+                y0, y1 = 0, height - 1
+            else:
+                y0, y1 = int(start_frac * height), int(end_frac * height)
+                x0, x1 = 0, width - 1
+
+            cv2.line(frame, (x0, y0), (x1, y1), c, thickness, lineType=cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -1075,6 +1155,64 @@ def synthesize_audio_molnar(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_stocastico(score, sr=SR):
+    """Matrice 05: ogni evento è un GLISSANDO (rampa di frequenza continua) invece
+    di un tono fisso — stesso principio visivo del fascio che diverge: il suono
+    non sta mai fermo su un'altezza, scivola da un punto all'altro. Il drone di
+    fondo usa una deriva casuale lenta (random walk) invece della texture fissa,
+    coerente con l'idea di campo stocastico continuo."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
+    t_ax = np.linspace(0, duration, N)
+
+    env_full = np.interp(t_ax, np.linspace(0, duration, len(score["macro_envelope"])), score["macro_envelope"])
+
+    # drone di fondo: random walk lento in frequenza (deriva stocastica continua)
+    rng_drone = np.random.RandomState(score["seed"] + 707)
+    steps = rng_drone.normal(0, 0.6, N // 200 + 2)
+    walk = np.cumsum(steps)
+    walk = np.interp(np.arange(N), np.linspace(0, N, len(walk)), walk)
+    base_freq = 60.0 * (2 ** (walk / 24))  # deriva contenuta entro circa un'ottava
+    phase_drone = 2 * np.pi * np.cumsum(base_freq) / sr
+    drone = np.sin(phase_drone) * (0.05 + 0.08 * env_full)
+    out_l += drone
+    out_r += drone
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.05 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+
+        seed_e = int((e["t"] * 1000) % (2 ** 31))
+        rng_e = np.random.RandomState(seed_e)
+
+        freq_start = 440.0 * (2 ** ((e["pitch"] - 69) / 12))
+        # il glissando diverge di un intervallo casuale (fino a un'ottava), come le
+        # linee del fascio visivo che si aprono nel tempo
+        semitone_shift = rng_e.uniform(-12, 12) * (0.3 + 0.7 * e["vel"])
+        freq_end = freq_start * (2 ** (semitone_shift / 12))
+
+        seg_t = np.arange(seg_len) / sr
+        inst_freq = np.linspace(freq_start, freq_end, seg_len)
+        phase = 2 * np.pi * np.cumsum(inst_freq) / sr
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = np.sin(phase) * env_local * e["vel"] * 0.42
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -1121,6 +1259,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Grid Deviation Detection")
     if module_id == "04":
         analisi.append("Tape Decay Tracking")
+    if module_id == "05":
+        analisi.append("Poisson Point Field / Divergent Line Sweep")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -1135,7 +1275,7 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
     righe.append("")
     righe.append(f'"{meta["quote"]}"')
     righe.append("")
-    righe.append("> TECHNICAL LOG SHEET:")
+    righe.append(":: TECHNICAL LOG SHEET:")
     righe.append(f"* File: matrice_output_{params['timestamp'].replace('/', '').replace(':', '').replace(' ', '_')}")
     righe.append(f"* Modulo: {module_id} — {meta['nome']}")
     righe.append(f"* Seed (utente): {params['seed']}")
@@ -1167,7 +1307,7 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
     if counts.get("video", 0) > 0:
         righe.append(f"* Eventi Video (tagli scena): {counts.get('video', 0)}")
     righe.append("")
-    righe.append(f"> Regia e Algoritmo: {brand}")
+    righe.append(f":: Regia e Algoritmo: {brand}")
     righe.append("")
     righe.append(f"#generativeart #proceduralart #digitalminimalism {meta['hashtag']}")
     righe.append("#computationalminimalism #brutalistart #glitchart #audiovisual")
@@ -1204,22 +1344,26 @@ MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {module_id}"
 MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
-              "04": render_frame_jeck}
+              "04": render_frame_jeck, "05": render_frame_stocastico}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
-             "04": synthesize_audio_jeck}
+             "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
 if module_id == "02":
-    st.caption("Modulo Henke: un mosaico di 12 blocchi (4 colonne × bassi/medi/alti) "
+    st.caption("Modulo 02: un mosaico di 12 blocchi (4 colonne × bassi/medi/alti) "
                "si ricompone in base all'energia reale delle tre bande di frequenza.")
 elif module_id == "03":
-    st.caption("Modulo Molnár: una griglia rigida resta quasi sempre identica. Devia "
+    st.caption("Modulo 03: una griglia rigida resta quasi sempre identica. Devia "
                "solo sui colpi audio davvero forti (o raramente da sé, senza audio).")
 elif module_id == "04":
     _usura_count_preview = load_usura_count()
-    st.caption(f"Modulo Jeck: questa istanza ha già generato {_usura_count_preview} volte. "
+    st.caption(f"Modulo 04: questa istanza ha già generato {_usura_count_preview} volte. "
                f"Più cresce il numero, più il segnale è consumato — non si azzera da sé.")
+elif module_id == "05":
+    st.caption("Modulo 05: nessuna griglia e nessuna cella. Ogni evento apre un fascio "
+               "di linee divergenti che attraversa l'intero fotogramma, su un fondo di "
+               "pulviscolo stocastico.")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -1295,7 +1439,7 @@ with st.sidebar:
                                           disabled=(palette != "Multicolore (per fonte)"))
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
     elif module_id == "02":
-        # Modulo Henke: il mosaico è sempre colorato per banda — niente orientamento/
+        # Modulo 02: il mosaico è sempre colorato per banda — niente orientamento/
         # linee/palette (non esistono più grani da colorare individualmente)
         st.caption("Il mosaico si ricompone in base all'energia reale di bassi/medi/alti "
                    "(o a sequenze procedurali se non carichi audio). Scegli i colori delle tre righe.")
@@ -1314,7 +1458,7 @@ with st.sidebar:
         position_mode = "pan"
         show_source_legend = False
     elif module_id == "03":
-        # Modulo Molnár: griglia rigida, quasi sempre uniforme — densità, colori
+        # Modulo 03: griglia rigida, quasi sempre uniforme — densità, colori
         # per banda e ritmo delle deviazioni sono personalizzabili
         st.caption("La griglia resta identica quasi sempre. Il colore della deviazione "
                    "dipende dalla banda del colpo che l'ha causata (bassi/medi/alti).")
@@ -1344,8 +1488,8 @@ with st.sidebar:
         orientamento, num_lanes, palette = "verticale", 10, "Multicolore (per fonte)"
         position_mode = "pan"
         show_source_legend = False
-    else:
-        # Modulo Jeck: riusa lo stesso linguaggio visivo/sonoro di Ikeda, ma lo
+    elif module_id == "04":
+        # Modulo 04: riusa lo stesso linguaggio visivo/sonoro del modulo 01, ma lo
         # consuma in base a quante volte è già stato generato — persistente su disco
         st.caption("Il degrado cresce col numero di generazioni fatte finora su questa "
                    "istanza (satura dopo 50). Non c'è modo di 'pulirlo' se non azzerarlo.")
@@ -1393,6 +1537,43 @@ with st.sidebar:
         grid_cols, accent_color = 10, (235, 40, 60)
         position_mode = "pan"
         deviation_sensitivity, deviation_min_gap = 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 05: campo stocastico continuo — niente griglia, niente celle.
+        # Riusa lo stesso sistema di colori/comandi degli altri moduli, ma la resa
+        # visiva è fasci di linee divergenti su un fondo di pulviscolo.
+        st.caption("Ogni evento apre un fascio di linee che diverge nel tempo, invece "
+                   "di una barra confinata in una corsia. 'Numero di linee' qui indica "
+                   "quante linee compongono ciascun fascio.")
+        orientamento_label_05 = st.radio("Orientamento fasci", ["Verticali", "Orizzontali", "Verticali + Orizzontali"],
+                                          horizontal=True, key="orientamento_05")
+        ORIENTAMENTI_05 = {"Verticali": "verticale", "Orizzontali": "orizzontale",
+                            "Verticali + Orizzontali": "misto"}
+        orientamento = ORIENTAMENTI_05[orientamento_label_05]
+        num_lanes = st.slider("Numero di linee per fascio", 1, 24, 10, key="num_lanes_05")
+        posizione_label_05 = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_05")
+        position_mode = "pan" if posizione_label_05 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_05 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_05")
+        band_colors = None
+        if usa_banda_05:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_5 = st.color_picker("Bassi", "#EB2828", key="stoc_bassi")
+            c_medi_5 = st.color_picker("Medi", "#FFAA00", key="stoc_medi")
+            c_alti_5 = st.color_picker("Alti", "#00C8FF", key="stoc_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_5), "mid": _hex_to_rgb(c_medi_5),
+                            "treble": _hex_to_rgb(c_alti_5)}
+        else:
+            palette_options_5 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_5, key="palette_05")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
 
 # ------------------------------------------------------------
@@ -1502,6 +1683,8 @@ if st.button("🚀 GENERA", use_container_width=True):
             extra_kwargs = {"position_mode": position_mode}
         elif module_id == "04":
             extra_kwargs = {"usura_level": usura_level_effettivo}
+        elif module_id == "05":
+            extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
             return render_frame_fn(t, score, width=export_w, height=export_h,
