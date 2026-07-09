@@ -126,6 +126,18 @@ MODULES = {
         "quote_en": "The network never changes shape. Only the current running through it, for an instant.",
         "hashtag": "#networkgraph #circuitart",
     },
+    "10": {
+        "nome": "Matrice 10 — Spettro Radiale",
+        "nome_en": "Matrix 10 — Radial Spectrum",
+        "effetto": "Concentric Band Rings",
+        "processo": "Tre Anelli Concentrici Reattivi a Bassi/Medi/Alti",
+        "processo_en": "Three Concentric Rings Reactive to Bass/Mid/Treble",
+        "motore_tag": "tre bande, sempre in ascolto",
+        "motore_tag_en": "three bands, always listening",
+        "quote": "Non c'è un colpo che accende tutto. Ci sono tre bande che respirano sempre, ognuna per conto suo.",
+        "quote_en": "No single hit lights everything up. Three bands breathe constantly, each on its own.",
+        "hashtag": "#radialspectrum #audioreactive",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -1375,6 +1387,70 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
     return frame
 
 
+def render_frame_radiale(t, score, width=960, height=540, orientation="verticale",
+                          num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                          position_mode="pan"):
+    """Matrice 10: nessuna corsia lineare — tre ANELLI CONCENTRICI (bassi dentro,
+    medi al centro, alti fuori), ognuno pilotato IN CONTINUO dall'energia reale
+    della propria banda (non solo dai colpi discreti): raggio e irregolarità
+    pulsano sempre, anche fra un evento e l'altro. Gli eventi aggiungono solo
+    brevi spuntoni luminosi sull'anello della loro banda, nella direzione della
+    loro posizione (pan/frequenza) — mai un oggetto proprio, solo un guizzo
+    sopra ciò che già pulsa da sé."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+    cx, cy = width / 2.0, height / 2.0
+    base_r = min(width, height) * 0.5
+
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+    bc = band_colors or DEFAULT_BAND_COLORS
+    seed = score["seed"]
+
+    rings = [("bass", 0.20, 8), ("mid", 0.34, 14), ("treble", 0.46, 22)]
+    n_lanes = max(3, int(num_lanes))
+    n_points = max(60, n_lanes * 6)
+
+    ring_r_by_band = {}
+    for band_name, rel_r, spikes in rings:
+        val = _band_block_value(mosaic[band_name], mode, block_seconds, t)
+        ring_r = base_r * rel_r * (0.7 + 0.6 * val)
+        ring_r_by_band[band_name] = ring_r
+        base_color = bc.get(band_name, (140, 140, 150))
+        shade = 0.35 + 0.65 * val
+        color = tuple(int(ch * shade) for ch in base_color)
+
+        angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+        wob = 1.0 + 0.06 * val * np.sin(angles * spikes + t * 1.3 + seed * 0.01)
+        xs = (cx + ring_r * wob * np.cos(angles)).astype(np.int32)
+        ys = (cy + ring_r * wob * np.sin(angles)).astype(np.int32)
+        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
+        cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    for e in active:
+        band_name = e.get("band", "mid")
+        if band_name not in ring_r_by_band:
+            band_name = "mid"
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        fade = 1.0 - prog
+        color = get_event_color(e, palette, band_colors)
+        c = tuple(int(ch * fade) for ch in color)
+
+        if orientation == "orizzontale":
+            ang = np.pi * min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+        else:
+            ang = 2 * np.pi * min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+
+        ring_r = ring_r_by_band[band_name]
+        spike_r = ring_r * (1.0 + 0.5 * e["vel"] * fade)
+        x0, y0 = int(cx + ring_r * np.cos(ang)), int(cy + ring_r * np.sin(ang))
+        x1, y1 = int(cx + spike_r * np.cos(ang)), int(cy + spike_r * np.sin(ang))
+        cv2.line(frame, (x0, y0), (x1, y1), c, max(2, int(2 + 3 * fade)), cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -1857,6 +1933,59 @@ def synthesize_audio_rete(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_radiale(score, sr=SR):
+    """Matrice 10: tre oscillatori simultanei (grave/medio/acuto), ognuno modulato
+    IN CONTINUO dall'energia reale della propria banda — esattamente come i tre
+    anelli visivi, il drone risponde sempre a bassi/medi/alti, non solo ai colpi
+    discreti. Gli eventi reali si sovrappongono come toni brevi per la sincronia
+    col guizzo visivo sull'anello corrispondente."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    t_ax = np.arange(N) / sr
+
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+
+    step = 0.05
+    n_steps = int(duration / step) + 2
+    times_steps = np.arange(n_steps) * step
+    bass_vals = np.array([_band_block_value(mosaic["bass"], mode, block_seconds, tt) for tt in times_steps])
+    mid_vals = np.array([_band_block_value(mosaic["mid"], mode, block_seconds, tt) for tt in times_steps])
+    treble_vals = np.array([_band_block_value(mosaic["treble"], mode, block_seconds, tt) for tt in times_steps])
+    bass_env = np.interp(t_ax, times_steps, bass_vals)
+    mid_env = np.interp(t_ax, times_steps, mid_vals)
+    treble_env = np.interp(t_ax, times_steps, treble_vals)
+
+    osc_bass = np.sin(2 * np.pi * 60.0 * t_ax) * (0.10 + 0.20 * bass_env)
+    osc_mid = np.sin(2 * np.pi * 220.0 * t_ax) * (0.06 + 0.14 * mid_env)
+    osc_treble = np.sin(2 * np.pi * 880.0 * t_ax) * (0.04 + 0.10 * treble_env)
+    drone = osc_bass + osc_mid + osc_treble
+    out_l = drone.copy()
+    out_r = drone.copy()
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.05 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 220.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        tone = np.sin(2 * np.pi * freq * seg_t)
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = tone * env_local * e["vel"] * 0.3
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -1911,6 +2040,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Lissajous Parametric Curve / Phosphor Persistence Trail")
     if module_id == "09":
         analisi.append("Fixed Network Topology / Impulse Propagation")
+    if module_id == "10":
+        analisi.append("Continuous Band Envelope Following / Concentric Ring Modulation")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -2044,10 +2175,12 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
               "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
-              "07": render_frame_datastream, "08": render_frame_oscilloscopio, "09": render_frame_rete}
+              "07": render_frame_datastream, "08": render_frame_oscilloscopio, "09": render_frame_rete,
+              "10": render_frame_radiale}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
              "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
-             "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio, "09": synthesize_audio_rete}
+             "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio, "09": synthesize_audio_rete,
+             "10": synthesize_audio_radiale}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -2081,6 +2214,12 @@ elif module_id == "09":
     st.caption("Modulo 09: l'unica rete a topologia fissa. Nodi e collegamenti non "
                "cambiano mai forma — restano un circuito spento finché un evento non "
                "accende il nodo più vicino e la corrente si propaga lungo la rete.")
+elif module_id == "10":
+    st.caption("Modulo 10: tre anelli concentrici (bassi/medi/alti) pulsano sempre, "
+               "in continuo, con l'energia reale delle tre bande — non solo ai colpi. "
+               "Gli eventi aggiungono solo brevi spuntoni luminosi sopra l'anello.")
+
+
 
 
 
@@ -2400,7 +2539,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "09":
         # Modulo 09: unica matrice a topologia fissa — nodi e archi non cambiano
         # mai posizione. 'Numero di linee' qui è il numero di nodi della rete
         # (moltiplicato internamente per una densità di collegamenti fissa).
@@ -2432,6 +2571,40 @@ with st.sidebar:
         else:
             palette_options_9 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_9, key="palette_09")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 10: tre anelli concentrici sempre pulsanti con l'energia reale di
+        # bassi/medi/alti. 'Numero di linee' qui è la risoluzione angolare degli
+        # anelli (quanti segmenti li compongono).
+        st.caption("Gli anelli pulsano sempre con le tre bande, anche senza eventi. "
+                   "'Numero di linee' qui regola la risoluzione angolare degli anelli.")
+        orientamento_label_10 = st.radio("Copertura guizzi evento", ["Cerchio completo (360°)", "Semicerchio (180°)"],
+                                          horizontal=True, key="orientamento_10")
+        orientamento = "verticale" if orientamento_label_10 == "Cerchio completo (360°)" else "orizzontale"
+        num_lanes = st.slider("Risoluzione anelli", 20, 120, 40, key="num_lanes_10")
+        posizione_label_10 = st.radio("Posizione guizzi", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_10")
+        position_mode = "pan" if posizione_label_10 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_10 = st.checkbox("Colori separati per bassi/medi/alti", value=True, key="banda_toggle_10")
+        band_colors = None
+        if usa_banda_10:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_10 = st.color_picker("Bassi", "#EB2828", key="rad_bassi")
+            c_medi_10 = st.color_picker("Medi", "#FFAA00", key="rad_medi")
+            c_alti_10 = st.color_picker("Alti", "#00C8FF", key="rad_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_10), "mid": _hex_to_rgb(c_medi_10),
+                            "treble": _hex_to_rgb(c_alti_10)}
+        else:
+            palette_options_10 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_10, key="palette_10")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
@@ -2550,6 +2723,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         elif module_id == "07":
             extra_kwargs = {"position_mode": position_mode}
         elif module_id == "09":
+            extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "10":
             extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
