@@ -101,6 +101,18 @@ MODULES = {
         "quote_en": "No shapes: only digits falling, never truly still.",
         "hashtag": "#datastream #generativetypography",
     },
+    "08": {
+        "nome": "Matrice 08 — Traccia Oscilloscopica",
+        "nome_en": "Matrix 08 — Oscilloscope Trace",
+        "effetto": "Lissajous Trace",
+        "processo": "Curva Parametrica Continua + Scia Fosforescente",
+        "processo_en": "Continuous Parametric Curve + Phosphor Trail",
+        "motore_tag": "curva continua a persistenza",
+        "motore_tag_en": "continuous curve with persistence",
+        "quote": "Non ci sono più oggetti: solo una linea che non smette di disegnarsi.",
+        "quote_en": "There are no more objects: only a line that never stops drawing itself.",
+        "hashtag": "#oscilloscope #lissajous",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -1176,6 +1188,70 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     return frame
 
 
+def render_frame_oscilloscopio(t, score, width=960, height=540, orientation="verticale",
+                                num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
+    """Matrice 08: nessun oggetto discreto — una SOLA TRACCIA CONTINUA disegna una
+    figura di Lissajous, come l'oscilloscopio di un synth analogico. Non ci sono
+    eventi che generano forme proprie: tutto è una curva parametrica unica che si
+    deforma nel tempo, con una scia fosforescente (persistenza) che sfuma invece
+    di essere ridisegnata da zero. 'Numero di linee' qui regola la risoluzione/
+    lunghezza della scia, non un numero di corsie."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / duration) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+
+    cx, cy = width / 2.0, height / 2.0
+    if orientation == "verticale":
+        amp_x, amp_y = width * 0.28, height * 0.40
+    elif orientation == "orizzontale":
+        amp_x, amp_y = width * 0.40, height * 0.28
+    else:
+        amp_x, amp_y = width * 0.36, height * 0.36
+
+    seed = score["seed"]
+    freq_x = 3 + (seed % 5)
+    freq_y = 2 + ((seed // 5) % 5)
+    phase_shift = t * (0.03 + 0.05 * macro_v)
+
+    n_lanes = max(1, int(num_lanes))
+    n_trail = max(24, n_lanes * 12)
+    trail_span = 0.6
+    amp_scale = 0.5 + 0.5 * macro_v
+
+    # eventi che potrebbero toccare la finestra della scia (t - trail_span .. t)
+    window_events = [e for e in score["events"]
+                     if e["t"] <= t and e["t"] + max(e["dur"], 0.05) >= t - trail_span]
+
+    for i in range(n_trail):
+        frac = i / n_trail
+        tt = t - frac * trail_span
+        if tt < 0:
+            continue
+        ax, ay = amp_x * amp_scale, amp_y * amp_scale
+        x = cx + ax * np.sin(2 * np.pi * freq_x * tt * 0.5 + phase_shift)
+        y = cy + ay * np.sin(2 * np.pi * freq_y * tt * 0.5 + phase_shift * 1.3 + 0.7)
+        alpha = (1.0 - frac) ** 2
+
+        seg_color = None
+        for e in window_events:
+            if e["t"] <= tt <= e["t"] + max(e["dur"], 0.05):
+                seg_color = get_event_color(e, palette, band_colors)
+                break
+
+        if seg_color is not None:
+            color = tuple(int(c * alpha) for c in seg_color)
+        else:
+            g = int(130 * alpha)
+            color = (g, g, g)
+
+        r = max(1, int(1 + 2 * alpha))
+        cv2.circle(frame, (int(x), int(y)), r, color, -1, lineType=cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -1578,6 +1654,51 @@ def synthesize_audio_datastream(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_oscilloscopio(score, sr=SR):
+    """Matrice 08: un drone continuo a due oscillatori leggermente disaccordati
+    (stesso rapporto armonico della figura di Lissajous visiva) che genera
+    battimenti lenti — nessun ritmo scandito a evento, proprio come la traccia
+    visiva non ha oggetti discreti. Gli eventi reali si sovrappongono come toni
+    brevi, per restare comunque sincronizzati col guizzo del colore sulla curva."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    t_ax = np.arange(N) / sr
+
+    seed = score["seed"]
+    freq_x = 3 + (seed % 5)
+    freq_y = 2 + ((seed // 5) % 5)
+    base_f = 55.0
+
+    env_full = np.interp(t_ax, np.linspace(0, duration, len(score["macro_envelope"])), score["macro_envelope"])
+    osc_x = np.sin(2 * np.pi * base_f * freq_x * 0.5 * t_ax)
+    osc_y = np.sin(2 * np.pi * base_f * freq_y * 0.5 * t_ax * 1.003)  # leggero detuning: battimenti
+    drone = (osc_x * 0.5 + osc_y * 0.5) * (0.07 + 0.10 * env_full)
+    out_l = drone.copy()
+    out_r = drone * 0.9 + (osc_y - osc_x) * 0.03
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.05 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 220.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        tone = np.sin(2 * np.pi * freq * seg_t)
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = tone * env_local * e["vel"] * 0.30
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -1628,6 +1749,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("2D Cellular Automaton Field / Granular Density Synthesis")
     if module_id == "07":
         analisi.append("Glyph Stream Rendering / Square-Wave Data Clock")
+    if module_id == "08":
+        analisi.append("Lissajous Parametric Curve / Phosphor Persistence Trail")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -1761,10 +1884,10 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
               "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
-              "07": render_frame_datastream}
+              "07": render_frame_datastream, "08": render_frame_oscilloscopio}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
              "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
-             "07": synthesize_audio_datastream}
+             "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -1790,6 +1913,12 @@ elif module_id == "07":
     st.caption("Modulo 07: un flusso continuo di caratteri scorre in colonne, come un "
                "readout che non si ferma mai. Gli eventi accendono col proprio colore "
                "i caratteri della corsia in cui accadono.")
+elif module_id == "08":
+    st.caption("Modulo 08: nessun oggetto discreto. Una sola curva continua (figura "
+               "di Lissajous) si disegna con una scia fosforescente; gli eventi "
+               "colorano solo il tratto di curva corrispondente al loro istante.")
+
+
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -2038,7 +2167,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "07":
         # Modulo 07: il flusso di caratteri scorre da sé in ogni corsia — gli eventi
         # accendono solo il colore della corsia in cui accadono, non disegnano forme.
         st.caption("Il flusso di caratteri scorre sempre, anche senza eventi (in grigio "
@@ -2070,6 +2199,38 @@ with st.sidebar:
         else:
             palette_options_7 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_7, key="palette_07")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 08: nessuna corsia audio-reattiva nel senso classico — la curva è
+        # unica e continua. 'Numero di linee' qui regola solo la lunghezza della
+        # scia fosforescente (persistenza), non un numero di corsie.
+        st.caption("Non ci sono corsie: la curva è una sola. 'Numero di linee' qui "
+                   "allunga o accorcia la scia fosforescente che la segue.")
+        orientamento_label_08 = st.radio("Proporzione figura", ["Verticale", "Orizzontale", "Bilanciata"],
+                                          horizontal=True, key="orientamento_08")
+        ORIENTAMENTI_08 = {"Verticale": "verticale", "Orizzontale": "orizzontale", "Bilanciata": "misto"}
+        orientamento = ORIENTAMENTI_08[orientamento_label_08]
+        num_lanes = st.slider("Lunghezza scia (persistenza)", 1, 24, 10, key="num_lanes_08")
+
+        usa_banda_08 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_08")
+        band_colors = None
+        if usa_banda_08:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_8 = st.color_picker("Bassi", "#EB2828", key="osc_bassi")
+            c_medi_8 = st.color_picker("Medi", "#FFAA00", key="osc_medi")
+            c_alti_8 = st.color_picker("Alti", "#00C8FF", key="osc_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_8), "mid": _hex_to_rgb(c_medi_8),
+                            "treble": _hex_to_rgb(c_alti_8)}
+        else:
+            palette_options_8 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_8, key="palette_08")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
