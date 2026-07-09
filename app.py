@@ -9,6 +9,7 @@ import cv2
 import os
 import json
 import tempfile
+from functools import lru_cache
 
 SR = 44100
 FPS = 30
@@ -112,6 +113,18 @@ MODULES = {
         "quote": "Non ci sono più oggetti: solo una linea che non smette di disegnarsi.",
         "quote_en": "There are no more objects: only a line that never stops drawing itself.",
         "hashtag": "#oscilloscope #lissajous",
+    },
+    "09": {
+        "nome": "Matrice 09 — Rete",
+        "nome_en": "Matrix 09 — Network",
+        "effetto": "Circuit Pulse",
+        "processo": "Topologia Fissa + Propagazione d'Impulso",
+        "processo_en": "Fixed Topology + Impulse Propagation",
+        "motore_tag": "circuito spento finché non toccato",
+        "motore_tag_en": "circuit silent until touched",
+        "quote": "La rete non cambia mai forma. Solo la corrente che la attraversa, per un istante.",
+        "quote_en": "The network never changes shape. Only the current running through it, for an instant.",
+        "hashtag": "#networkgraph #circuitart",
     },
 }
 
@@ -1252,6 +1265,116 @@ def render_frame_oscilloscopio(t, score, width=960, height=540, orientation="ver
     return frame
 
 
+@lru_cache(maxsize=64)
+def _network_topology(seed, n_nodes):
+    """Topologia FISSA (nodi + archi) per la Matrice 09 — a differenza di tutte le
+    altre matrici, qui non nasce/scorre/decade nulla nel tempo: la rete è statica,
+    calcolata una volta sola dal seed. Solo l'ACCENSIONE dei nodi/archi cambia
+    nel tempo, in risposta agli eventi."""
+    n_nodes = max(3, int(n_nodes))
+    rng = np.random.RandomState((int(seed) * 1013 + n_nodes * 7919) & 0x7FFFFFFF)
+    positions = rng.uniform(0.08, 0.92, size=(n_nodes, 2))
+
+    diff = positions[:, None, :] - positions[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(axis=2))
+    np.fill_diagonal(dist, np.inf)
+    k = 3
+    order = np.argsort(dist, axis=1)
+    edges = set()
+    for i in range(n_nodes):
+        for j in order[i, :k]:
+            edges.add(tuple(sorted((int(i), int(j)))))
+
+    neighbors = {i: [] for i in range(n_nodes)}
+    for (a, b) in edges:
+        neighbors[a].append(b)
+        neighbors[b].append(a)
+
+    return positions, sorted(edges), neighbors
+
+
+def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
+                       num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                       position_mode="pan"):
+    """Matrice 09: l'unica con una TOPOLOGIA FISSA — nodi e collegamenti non
+    nascono, non scorrono, non decadono: sono sempre gli stessi per tutta la
+    durata, appena visibili come un circuito spento. Un evento non disegna un
+    oggetto proprio: accende il nodo più vicino alla sua posizione e l'impulso
+    si propaga per un istante lungo i collegamenti vicini, come corrente in un
+    circuito — poi si spegne e la rete torna quieta. 'Numero di linee' qui è il
+    numero di nodi della rete."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / duration) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+
+    n_nodes = max(3, int(num_lanes) * 4)
+    positions, edges, neighbors = _network_topology(int(score["seed"]), n_nodes)
+    px = (positions[:, 0] * width).astype(int)
+    py = (positions[:, 1] * height).astype(int)
+
+    # circuito spento: archi e nodi appena visibili, sempre presenti
+    dim = int(8 + macro_v * 6)
+    for (a, b) in edges:
+        cv2.line(frame, (px[a], py[a]), (px[b], py[b]), (dim, dim, dim), 1, cv2.LINE_AA)
+    for i in range(n_nodes):
+        cv2.circle(frame, (px[i], py[i]), 2, (dim + 6, dim + 6, dim + 6), -1, cv2.LINE_AA)
+
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / duration) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame
+
+    band_y = {"bass": 0.85, "mid": 0.5, "treble": 0.15}
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+
+    for e in active:
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        fade = 1.0 - prog
+        color = get_event_color(e, palette, band_colors)
+
+        ex = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+        ey = band_y.get(e.get("band"), 0.5)
+        if orientation == "orizzontale":
+            ex, ey = ey, ex  # scambia gli assi: la corsia diventa verticale invece che orizzontale
+
+        d = (positions[:, 0] - ex) ** 2 + (positions[:, 1] - ey) ** 2
+        origin = int(np.argmin(d))
+
+        origin_c = tuple(int(c * fade) for c in color)
+        r_origin = max(3, int(4 + 8 * e["vel"] * fade))
+        cv2.circle(frame, (px[origin], py[origin]), r_origin, origin_c, -1, cv2.LINE_AA)
+
+        # propagazione dell'impulso per 2 salti lungo la rete, con decadimento
+        visited = {origin: 0}
+        frontier = [origin]
+        for hop in range(1, 3):
+            next_frontier = []
+            for n in frontier:
+                for nb in neighbors.get(n, []):
+                    if nb not in visited:
+                        visited[nb] = hop
+                        next_frontier.append(nb)
+            frontier = next_frontier
+
+        for node, hop in visited.items():
+            if hop == 0:
+                continue
+            hop_fade = fade * (1.0 - hop / 3.0)
+            if hop_fade <= 0:
+                continue
+            c = tuple(int(c * hop_fade) for c in color)
+            cv2.circle(frame, (px[node], py[node]), max(2, int(3 * hop_fade)), c, -1, cv2.LINE_AA)
+            for nb in neighbors.get(node, []):
+                if visited.get(nb, 99) < hop:
+                    cv2.line(frame, (px[node], py[node]), (px[nb], py[nb]), c, 1, cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -1699,6 +1822,41 @@ def synthesize_audio_oscilloscopio(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_rete(score, sr=SR):
+    """Matrice 09: nessun drone di fondo, nessuna texture continua — il circuito è
+    silenzioso finché non viene toccato. Ogni evento è un PLUCK a decadimento
+    esponenziale (come una corda pizzicata), con una seconda armonica leggera per
+    un timbro metallico da circuito. La risonanza dura più a lungo dell'evento
+    stesso, coerente con l'impulso che si propaga sulla rete visiva."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.25 * sr), int(e["dur"] * sr * 1.5))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 220.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        decay = np.exp(-seg_t * (3.0 + 4.0 * (1.0 - e["vel"])))
+        tone = np.sin(2 * np.pi * freq * seg_t) * decay
+        tone += 0.3 * np.sin(2 * np.pi * freq * 2.01 * seg_t) * decay
+        signal = tone * e["vel"] * 0.4
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -1751,6 +1909,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Glyph Stream Rendering / Square-Wave Data Clock")
     if module_id == "08":
         analisi.append("Lissajous Parametric Curve / Phosphor Persistence Trail")
+    if module_id == "09":
+        analisi.append("Fixed Network Topology / Impulse Propagation")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -1884,10 +2044,10 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
               "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
-              "07": render_frame_datastream, "08": render_frame_oscilloscopio}
+              "07": render_frame_datastream, "08": render_frame_oscilloscopio, "09": render_frame_rete}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
              "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
-             "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio}
+             "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio, "09": synthesize_audio_rete}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -1917,6 +2077,12 @@ elif module_id == "08":
     st.caption("Modulo 08: nessun oggetto discreto. Una sola curva continua (figura "
                "di Lissajous) si disegna con una scia fosforescente; gli eventi "
                "colorano solo il tratto di curva corrispondente al loro istante.")
+elif module_id == "09":
+    st.caption("Modulo 09: l'unica rete a topologia fissa. Nodi e collegamenti non "
+               "cambiano mai forma — restano un circuito spento finché un evento non "
+               "accende il nodo più vicino e la corrente si propaga lungo la rete.")
+
+
 
 
 
@@ -2202,7 +2368,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "08":
         # Modulo 08: nessuna corsia audio-reattiva nel senso classico — la curva è
         # unica e continua. 'Numero di linee' qui regola solo la lunghezza della
         # scia fosforescente (persistenza), non un numero di corsie.
@@ -2231,6 +2397,41 @@ with st.sidebar:
         else:
             palette_options_8 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_8, key="palette_08")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 09: unica matrice a topologia fissa — nodi e archi non cambiano
+        # mai posizione. 'Numero di linee' qui è il numero di nodi della rete
+        # (moltiplicato internamente per una densità di collegamenti fissa).
+        st.caption("La rete resta sempre la stessa forma: appena visibile finché un "
+                   "evento non accende il nodo più vicino e la corrente si propaga "
+                   "lungo i collegamenti vicini.")
+        orientamento_label_09 = st.radio("Assi corsia/banda", ["Standard", "Assi scambiati"],
+                                          horizontal=True, key="orientamento_09")
+        orientamento = "verticale" if orientamento_label_09 == "Standard" else "orizzontale"
+        num_lanes = st.slider("Numero di nodi", 3, 60, 15, key="num_lanes_09")
+        posizione_label_09 = st.radio("Posizione sulla rete", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_09")
+        position_mode = "pan" if posizione_label_09 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_09 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_09")
+        band_colors = None
+        if usa_banda_09:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_9 = st.color_picker("Bassi", "#EB2828", key="rete_bassi")
+            c_medi_9 = st.color_picker("Medi", "#FFAA00", key="rete_medi")
+            c_alti_9 = st.color_picker("Alti", "#00C8FF", key="rete_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_9), "mid": _hex_to_rgb(c_medi_9),
+                            "treble": _hex_to_rgb(c_alti_9)}
+        else:
+            palette_options_9 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_9, key="palette_09")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
@@ -2347,6 +2548,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         elif module_id == "06":
             extra_kwargs = {"position_mode": position_mode}
         elif module_id == "07":
+            extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "09":
             extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
