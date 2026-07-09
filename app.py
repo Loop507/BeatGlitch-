@@ -1086,7 +1086,7 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step
 
     x = int(col * col_w + col_w * 0.25)
     for row in range(n_rows):
-        if picks[row] > 0.85:
+        if picks[row] > 0.95:
             continue
         y = int((row - offset) * char_h)
         if y < char_h or y > height:
@@ -1106,7 +1106,7 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, 
 
     y = int(lane * row_h + row_h * 0.6)
     for col in range(n_cols):
-        if picks[col] > 0.85:
+        if picks[col] > 0.95:
             continue
         x = int((col - offset) * char_h)
         if x < char_h or x > width:
@@ -1246,7 +1246,7 @@ def render_frame_oscilloscopio(t, score, width=960, height=540, orientation="ver
             g = int(130 * alpha)
             color = (g, g, g)
 
-        r = max(1, int(1 + 2 * alpha))
+        r = max(2, int(3 + 4 * alpha))
         cv2.circle(frame, (int(x), int(y)), r, color, -1, lineType=cv2.LINE_AA)
 
     return frame
@@ -2177,7 +2177,7 @@ with st.sidebar:
         ORIENTAMENTI_07 = {"Verticale": "verticale", "Orizzontale": "orizzontale",
                             "Verticale + Orizzontale": "misto"}
         orientamento = ORIENTAMENTI_07[orientamento_label_07]
-        num_lanes = st.slider("Numero di corsie", 1, 120, 30, key="num_lanes_07")
+        num_lanes = st.slider("Numero di corsie", 1, 200, 60, key="num_lanes_07")
         posizione_label_07 = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
                                        horizontal=True, key="posizione_07")
         position_mode = "pan" if posizione_label_07 == "Pan stereo reale" else "frequenza"
