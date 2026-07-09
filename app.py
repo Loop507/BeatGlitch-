@@ -65,6 +65,14 @@ MODULES = {
         "quote": "Non reagisce e basta: cresce e si dirada anche quando nessuno la tocca.",
         "hashtag": "#cellularautomaton #generativetexture",
     },
+    "07": {
+        "nome": "Matrice 07 — Flusso Dati",
+        "effetto": "Data Stream Glyphs",
+        "processo": "Colonne di Caratteri Continue + Clock Stocastico",
+        "motore_tag": "flusso continuo di simboli",
+        "quote": "Non forme: solo cifre che cadono, mai davvero ferme.",
+        "hashtag": "#datastream #generativetypography",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -1028,6 +1036,104 @@ def render_frame_automaton(t, score, width=960, height=540, orientation="vertica
     return frame
 
 
+def render_frame_datastream(t, score, width=960, height=540, orientation="verticale",
+                             num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                             position_mode="pan"):
+    """Matrice 07: nessuna forma geometrica — un FLUSSO DI CARATTERI monospace che
+    scorre in colonne (o righe) continue, come un readout che non si ferma mai.
+    Ogni corsia scorre da sé indipendentemente dagli eventi (glifi radi, in grigio
+    spento); quando un evento è attivo in quella corsia, i suoi caratteri si
+    accendono col colore dell'evento. Nessuna barra, nessun blocco, nessuna linea:
+    solo simboli che cadono."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+    res = len(score["macro_envelope"])
+    env_idx = min(res - 1, int((t / duration) * res))
+    macro_v = float(score["macro_envelope"][env_idx])
+
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    silent = False
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / duration) * len(gate_env)))
+        silent = float(gate_env[gate_idx]) < SILENCE_THRESHOLD
+
+    num_lanes = max(1, int(num_lanes))
+    glyphs = "01.:+*#%$"
+    char_h = max(10, height // 28)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.3, char_h / 28.0)
+    base_gray = int(10 + macro_v * 14)
+
+    active_by_lane = {}
+    if not silent:
+        for e in score["events"]:
+            if e["t"] <= t <= e["t"] + max(e["dur"], 0.05):
+                lane_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+                lane_idx = int(lane_frac * num_lanes)
+                active_by_lane.setdefault(lane_idx, []).append(e)
+
+    scroll_orientation = orientation
+    if orientation == "misto":
+        scroll_orientation = "verticale" if int(t * 0.5) % 2 == 0 else "orizzontale"
+    scroll_speed = 6.0 + macro_v * 10.0  # celle al secondo
+
+    if scroll_orientation == "verticale":
+        n_rows = int(height / char_h) + 2
+        col_w = width / num_lanes
+        offset = (t * scroll_speed) % 1.0
+        time_step = int(t * scroll_speed)
+        for col in range(num_lanes):
+            active_events = active_by_lane.get(col, [])
+            lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
+                if active_events else None
+
+            seed_c = (col * 9973 + time_step) & 0x7FFFFFFF
+            rng_c = np.random.RandomState(seed_c)
+            picks = rng_c.random(n_rows)
+            char_idx = rng_c.randint(0, len(glyphs), n_rows)
+            color_pick = rng_c.random(n_rows)
+
+            x = int(col * col_w + col_w * 0.25)
+            for row in range(n_rows):
+                if picks[row] > 0.55:
+                    continue
+                y = int((row - offset) * char_h)
+                if y < char_h or y > height:
+                    continue
+                color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
+                    (base_gray, base_gray, base_gray)
+                cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+    else:
+        n_cols = int(width / char_h) + 2
+        row_h = height / num_lanes
+        offset = (t * scroll_speed) % 1.0
+        time_step = int(t * scroll_speed)
+        for lane in range(num_lanes):
+            active_events = active_by_lane.get(lane, [])
+            lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
+                if active_events else None
+
+            seed_c = (lane * 9973 + time_step) & 0x7FFFFFFF
+            rng_c = np.random.RandomState(seed_c)
+            picks = rng_c.random(n_cols)
+            char_idx = rng_c.randint(0, len(glyphs), n_cols)
+            color_pick = rng_c.random(n_cols)
+
+            y = int(lane * row_h + row_h * 0.6)
+            for col in range(n_cols):
+                if picks[col] > 0.55:
+                    continue
+                x = int((col - offset) * char_h)
+                if x < char_h or x > width:
+                    continue
+                color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
+                    (base_gray, base_gray, base_gray)
+                cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -1368,6 +1474,68 @@ def synthesize_audio_automaton(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_datastream(score, sr=SR):
+    """Matrice 07: timbro digitale a onda quadra (mai seno puro) — un clock di dati
+    che scandisce tick brevissimi e intermittenti, densità legata all'inviluppo
+    macro, quantizzati su una scala fissa (il 'readout' meccanico). Gli eventi
+    reali si sovrappongono come tick più marcati, con l'intonazione reale
+    dell'evento, per restare sincronizzati col guizzo visivo."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    out_l = np.zeros(N)
+    out_r = np.zeros(N)
+    res = len(score["macro_envelope"])
+    rng = np.random.RandomState(score["seed"] + 1111)
+
+    tick_dur = 0.02
+    tick_n = max(2, int(tick_dur * sr))
+    win = np.hanning(tick_n)
+    tick_t = np.arange(tick_n) / sr
+    scale = [0, 2, 3, 5, 7, 8, 10]  # scala minore, deliberatamente "meccanica"
+    step = 0.06
+    tpos = 0.0
+    while tpos < duration:
+        env_idx = min(res - 1, int((tpos / duration) * res))
+        macro_v = float(score["macro_envelope"][env_idx])
+        if rng.random() < (0.3 + 0.6 * macro_v):  # readout intermittente, non un clock pieno
+            start = int(tpos * sr)
+            end = min(N, start + tick_n)
+            if end > start:
+                seg_len = end - start
+                semitone = scale[rng.randint(0, len(scale))]
+                freq = 330.0 * (2 ** (semitone / 12)) * rng.choice([0.5, 1.0, 2.0])
+                square = np.sign(np.sin(2 * np.pi * freq * tick_t[:seg_len]))
+                sig = square * win[:seg_len] * (0.06 + 0.10 * macro_v)
+                pan = rng.uniform(-0.6, 0.6)
+                gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+                gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+                out_l[start:end] += sig * gain_l
+                out_r[start:end] += sig * gain_r
+        tpos += step
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.03 * sr), int(e["dur"] * sr * 0.5))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 440.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        square = np.sign(np.sin(2 * np.pi * freq * seg_t))
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = square * env_local * e["vel"] * 0.35
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -1418,6 +1586,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Poisson Point Field / Divergent Line Sweep")
     if module_id == "06":
         analisi.append("2D Cellular Automaton Field / Granular Density Synthesis")
+    if module_id == "07":
+        analisi.append("Glyph Stream Rendering / Square-Wave Data Clock")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -1501,9 +1671,11 @@ MODULE_TITLE = f"BEATGLITCH — MATRICE ENGINE {module_id}"
 MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
-              "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton}
+              "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
+              "07": render_frame_datastream}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
-             "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton}
+             "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
+             "07": synthesize_audio_datastream}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -1525,6 +1697,10 @@ elif module_id == "06":
     st.caption("Modulo 06: un automa cellulare 2D scorre come tessuto continuo sullo "
                "sfondo, mutando anche senza input. Gli eventi sbocciano sopra come "
                "fioriture morbide di colore, non barre né linee.")
+elif module_id == "07":
+    st.caption("Modulo 07: un flusso continuo di caratteri scorre in colonne, come un "
+               "readout che non si ferma mai. Gli eventi accendono col proprio colore "
+               "i caratteri della corsia in cui accadono.")
 
 # ------------------------------------------------------------
 # SIDEBAR — sorgenti e parametri
@@ -1736,7 +1912,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "06":
         # Modulo 06: il tessuto di fondo (automa cellulare 2D) muta da sé nel tempo,
         # indipendentemente dagli eventi — gli eventi aggiungono solo le fioriture
         # di colore sopra la texture continua.
@@ -1770,6 +1946,41 @@ with st.sidebar:
         else:
             palette_options_6 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_6, key="palette_06")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 07: il flusso di caratteri scorre da sé in ogni corsia — gli eventi
+        # accendono solo il colore della corsia in cui accadono, non disegnano forme.
+        st.caption("Il flusso di caratteri scorre sempre, anche senza eventi (in grigio "
+                   "spento). 'Numero di linee' qui è il numero di corsie del flusso.")
+        orientamento_label_07 = st.radio("Direzione flusso", ["Verticale", "Orizzontale", "Verticale + Orizzontale"],
+                                          horizontal=True, key="orientamento_07")
+        ORIENTAMENTI_07 = {"Verticale": "verticale", "Orizzontale": "orizzontale",
+                            "Verticale + Orizzontale": "misto"}
+        orientamento = ORIENTAMENTI_07[orientamento_label_07]
+        num_lanes = st.slider("Numero di corsie", 1, 24, 10, key="num_lanes_07")
+        posizione_label_07 = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_07")
+        position_mode = "pan" if posizione_label_07 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_07 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_07")
+        band_colors = None
+        if usa_banda_07:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_7 = st.color_picker("Bassi", "#EB2828", key="ds_bassi")
+            c_medi_7 = st.color_picker("Medi", "#FFAA00", key="ds_medi")
+            c_alti_7 = st.color_picker("Alti", "#00C8FF", key="ds_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_7), "mid": _hex_to_rgb(c_medi_7),
+                            "treble": _hex_to_rgb(c_alti_7)}
+        else:
+            palette_options_7 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_7, key="palette_07")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
@@ -1884,6 +2095,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         elif module_id == "05":
             extra_kwargs = {"position_mode": position_mode}
         elif module_id == "06":
+            extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "07":
             extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
