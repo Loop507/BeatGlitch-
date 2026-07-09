@@ -19,58 +19,86 @@ FPS = 30
 MODULES = {
     "01": {
         "nome": "Matrice 01 — Cellular Drift",
+        "nome_en": "Matrix 01 — Cellular Drift",
         "effetto": "Cellular Drift",
         "processo": "Matrice Condivisa",
+        "processo_en": "Shared Matrix",
         "motore_tag": "generativo condiviso",
+        "motore_tag_en": "shared generative",
         "quote": "Un unico dato ha generato insieme cio\' che si vede e cio\' che si sente.",
+        "quote_en": "A single piece of data generated what you see and what you hear together.",
         "hashtag": "#cellularautomaton #computationalminimalism",
     },
     "02": {
         "nome": "Matrice 02 — Macro/Micro Split",
+        "nome_en": "Matrix 02 — Macro/Micro Split",
         "effetto": "Macro Block Drift",
         "processo": "Struttura a Blocchi + Grana Micro",
+        "processo_en": "Block Structure + Micro Grain",
         "motore_tag": "macro/micro separati",
+        "motore_tag_en": "separate macro/micro",
         "quote": "La struttura non sfuma. Cambia di scatto, mentre la grana continua a vibrare.",
+        "quote_en": "The structure never fades. It cuts abruptly, while the grain keeps vibrating.",
         "hashtag": "#macromicron #granularsynthesis",
     },
     "03": {
         "nome": "Matrice 03 — Disordine Controllato",
+        "nome_en": "Matrix 03 — Controlled Disorder",
         "effetto": "Grid Deviation",
         "processo": "Griglia Rigida + Deviazioni Rare",
+        "processo_en": "Rigid Grid + Rare Deviations",
         "motore_tag": "griglia + eccezioni rare",
+        "motore_tag_en": "grid + rare exceptions",
         "quote": "La regola resta quasi sempre uguale. Quando si rompe, lo fa apposta.",
+        "quote_en": "The rule stays almost always the same. When it breaks, it does so on purpose.",
         "hashtag": "#griddeviation #controlleddisorder",
     },
     "04": {
         "nome": "Matrice 04 — Usura con Memoria",
+        "nome_en": "Matrix 04 — Wear with Memory",
         "effetto": "Tape Decay",
         "processo": "Degrado Cumulativo Persistente",
+        "processo_en": "Persistent Cumulative Decay",
         "motore_tag": "usura con memoria",
+        "motore_tag_en": "wear with memory",
         "quote": "Non reagisce solo a ora. Ricorda ogni volta che e' stato suonato prima.",
+        "quote_en": "It doesn't only react to now. It remembers every time it was played before.",
         "hashtag": "#tapedecay #memorydecay",
     },
     "05": {
         "nome": "Matrice 05 — Campi Stocastici",
+        "nome_en": "Matrix 05 — Stochastic Fields",
         "effetto": "Stochastic Field Sweep",
         "processo": "Fasci di Linee Divergenti + Pulviscolo Stocastico",
+        "processo_en": "Divergent Line Bundles + Stochastic Dust",
         "motore_tag": "campo continuo stocastico",
+        "motore_tag_en": "continuous stochastic field",
         "quote": "Niente griglia, niente cella. Solo traiettorie che si aprono come un ventaglio.",
+        "quote_en": "No grid, no cell. Only trajectories that open up like a fan.",
         "hashtag": "#stochasticfield #generativelines",
     },
     "06": {
         "nome": "Matrice 06 — Tessuto Vivente",
+        "nome_en": "Matrix 06 — Living Tissue",
         "effetto": "Living Automaton Bloom",
         "processo": "Automa Cellulare 2D Continuo + Fioriture Granulari",
+        "processo_en": "Continuous 2D Cellular Automaton + Granular Blooms",
         "motore_tag": "matrice che muta da sé",
+        "motore_tag_en": "self-mutating matrix",
         "quote": "Non reagisce e basta: cresce e si dirada anche quando nessuno la tocca.",
+        "quote_en": "It doesn't just react: it grows and thins out even when nothing touches it.",
         "hashtag": "#cellularautomaton #generativetexture",
     },
     "07": {
         "nome": "Matrice 07 — Flusso Dati",
+        "nome_en": "Matrix 07 — Data Stream",
         "effetto": "Data Stream Glyphs",
         "processo": "Colonne di Caratteri Continue + Clock Stocastico",
+        "processo_en": "Continuous Character Columns + Stochastic Clock",
         "motore_tag": "flusso continuo di simboli",
+        "motore_tag_en": "continuous symbol stream",
         "quote": "Non forme: solo cifre che cadono, mai davvero ferme.",
+        "quote_en": "No shapes: only digits falling, never truly still.",
         "hashtag": "#datastream #generativetypography",
     },
 }
@@ -1036,6 +1064,46 @@ def render_frame_automaton(t, score, width=960, height=540, orientation="vertica
     return frame
 
 
+def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step, glyphs,
+                             font, font_scale, base_gray, lane_color, height):
+    seed_c = (col * 9973 + time_step) & 0x7FFFFFFF
+    rng_c = np.random.RandomState(seed_c)
+    picks = rng_c.random(n_rows)
+    char_idx = rng_c.randint(0, len(glyphs), n_rows)
+    color_pick = rng_c.random(n_rows)
+
+    x = int(col * col_w + col_w * 0.25)
+    for row in range(n_rows):
+        if picks[row] > 0.85:
+            continue
+        y = int((row - offset) * char_h)
+        if y < char_h or y > height:
+            continue
+        color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
+            (base_gray, base_gray, base_gray)
+        cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+
+
+def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, glyphs,
+                          font, font_scale, base_gray, lane_color, width):
+    seed_c = (lane * 9973 + time_step) & 0x7FFFFFFF
+    rng_c = np.random.RandomState(seed_c)
+    picks = rng_c.random(n_cols)
+    char_idx = rng_c.randint(0, len(glyphs), n_cols)
+    color_pick = rng_c.random(n_cols)
+
+    y = int(lane * row_h + row_h * 0.6)
+    for col in range(n_cols):
+        if picks[col] > 0.85:
+            continue
+        x = int((col - offset) * char_h)
+        if x < char_h or x > width:
+            continue
+        color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
+            (base_gray, base_gray, base_gray)
+        cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+
+
 def render_frame_datastream(t, score, width=960, height=540, orientation="verticale",
                              num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
                              position_mode="pan"):
@@ -1043,8 +1111,10 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     scorre in colonne (o righe) continue, come un readout che non si ferma mai.
     Ogni corsia scorre da sé indipendentemente dagli eventi (glifi radi, in grigio
     spento); quando un evento è attivo in quella corsia, i suoi caratteri si
-    accendono col colore dell'evento. Nessuna barra, nessun blocco, nessuna linea:
-    solo simboli che cadono."""
+    accendono col colore dell'evento. In modalità 'misto' verticale e orizzontale
+    convivono nello STESSO fotogramma (corsie pari = colonne, corsie dispari =
+    righe), non alternati nel tempo. Nessuna barra, nessun blocco: solo simboli
+    che cadono."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     duration = max(score["duration"], 1e-6)
     res = len(score["macro_envelope"])
@@ -1073,63 +1143,35 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
                 lane_idx = int(lane_frac * num_lanes)
                 active_by_lane.setdefault(lane_idx, []).append(e)
 
-    scroll_orientation = orientation
-    if orientation == "misto":
-        scroll_orientation = "verticale" if int(t * 0.5) % 2 == 0 else "orizzontale"
+    if orientation == "verticale":
+        vertical_lanes, horizontal_lanes = list(range(num_lanes)), []
+    elif orientation == "orizzontale":
+        vertical_lanes, horizontal_lanes = [], list(range(num_lanes))
+    else:  # misto: convivono nello stesso fotogramma, corsie pari/dispari
+        vertical_lanes = [i for i in range(num_lanes) if i % 2 == 0]
+        horizontal_lanes = [i for i in range(num_lanes) if i % 2 == 1]
+
     scroll_speed = 6.0 + macro_v * 10.0  # celle al secondo
+    offset = (t * scroll_speed) % 1.0
+    time_step = int(t * scroll_speed)
+    col_w = width / num_lanes
+    row_h = height / num_lanes
+    n_rows = int(height / char_h) + 2
+    n_cols = int(width / char_h) + 2
 
-    if scroll_orientation == "verticale":
-        n_rows = int(height / char_h) + 2
-        col_w = width / num_lanes
-        offset = (t * scroll_speed) % 1.0
-        time_step = int(t * scroll_speed)
-        for col in range(num_lanes):
-            active_events = active_by_lane.get(col, [])
-            lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
-                if active_events else None
+    for col in vertical_lanes:
+        active_events = active_by_lane.get(col, [])
+        lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
+            if active_events else None
+        _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step, glyphs,
+                                 font, font_scale, base_gray, lane_color, height)
 
-            seed_c = (col * 9973 + time_step) & 0x7FFFFFFF
-            rng_c = np.random.RandomState(seed_c)
-            picks = rng_c.random(n_rows)
-            char_idx = rng_c.randint(0, len(glyphs), n_rows)
-            color_pick = rng_c.random(n_rows)
-
-            x = int(col * col_w + col_w * 0.25)
-            for row in range(n_rows):
-                if picks[row] > 0.85:
-                    continue
-                y = int((row - offset) * char_h)
-                if y < char_h or y > height:
-                    continue
-                color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
-                    (base_gray, base_gray, base_gray)
-                cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
-    else:
-        n_cols = int(width / char_h) + 2
-        row_h = height / num_lanes
-        offset = (t * scroll_speed) % 1.0
-        time_step = int(t * scroll_speed)
-        for lane in range(num_lanes):
-            active_events = active_by_lane.get(lane, [])
-            lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
-                if active_events else None
-
-            seed_c = (lane * 9973 + time_step) & 0x7FFFFFFF
-            rng_c = np.random.RandomState(seed_c)
-            picks = rng_c.random(n_cols)
-            char_idx = rng_c.randint(0, len(glyphs), n_cols)
-            color_pick = rng_c.random(n_cols)
-
-            y = int(lane * row_h + row_h * 0.6)
-            for col in range(n_cols):
-                if picks[col] > 0.85:
-                    continue
-                x = int((col - offset) * char_h)
-                if x < char_h or x > width:
-                    continue
-                color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
-                    (base_gray, base_gray, base_gray)
-                cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+    for lane in horizontal_lanes:
+        active_events = active_by_lane.get(lane, [])
+        lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
+            if active_events else None
+        _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, glyphs,
+                              font, font_scale, base_gray, lane_color, width)
 
     return frame
 
@@ -1555,7 +1597,8 @@ def fit_audio_length(y, N):
 
 
 def generate_text_report(params, score, module_id="01", brand="Loop507", vol=None):
-    """Report nel formato standard Loop507 (:: MOTORE / EFFETTO / TECHNICAL LOG SHEET)."""
+    """Report nel formato standard Loop507 (:: MOTORE / EFFETTO / TECHNICAL LOG SHEET).
+    Bilingue: italiano (come sempre) seguito dalla versione inglese."""
     meta = MODULES[module_id]
     counts = {}
     for e in score["events"]:
@@ -1565,9 +1608,6 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
     for e in score["events"]:
         if "band" in e:
             band_counts[e["band"]] = band_counts.get(e["band"], 0) + 1
-
-    labels = {"ca": "Procedurale", "midi": "MIDI", "audio": "Audio", "video": "Video"}
-    fonti_attive = [labels[k] for k in ("midi", "audio", "video") if counts.get(k, 0) > 0]
 
     analisi = ["Automa Cellulare", "Rumore Multi-Ottava"]
     if counts.get("audio", 0) > 0:
@@ -1591,54 +1631,103 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
+    ts_clean = params["timestamp"].replace("/", "").replace(":", "").replace(" ", "_")
 
-    righe = []
-    righe.append(f"[BEATGLITCH_MATRICE_ENGINE_{module_id}] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
-    righe.append(f":: MOTORE: matrice_engine_{module_id} [v1.0 — {meta['motore_tag']}]")
-    righe.append(f":: EFFETTO: {meta['effetto']} — Regola {params['rule']}")
-    righe.append(f":: ANALISI: {' / '.join(analisi)}")
-    fonti_str = " + ".join(fonti_attive) if fonti_attive else "Nessuna (generazione pura)"
-    righe.append(f":: PROCESSO: {meta['processo']} — Fonti: {fonti_str}")
+    def build(lang):
+        it = (lang == "it")
+        labels = {"ca": "Procedurale" if it else "Procedural", "midi": "MIDI",
+                  "audio": "Audio", "video": "Video"}
+        fonti_attive = [labels[k] for k in ("midi", "audio", "video") if counts.get(k, 0) > 0]
+        fonti_str = " + ".join(fonti_attive) if fonti_attive else \
+            ("Nessuna (generazione pura)" if it else "None (pure generation)")
+
+        nome = meta["nome"] if it else meta["nome_en"]
+        processo = meta["processo"] if it else meta["processo_en"]
+        motore_tag = meta["motore_tag"] if it else meta["motore_tag_en"]
+        quote = meta["quote"] if it else meta["quote_en"]
+
+        r = []
+        r.append(f"[BEATGLITCH_MATRICE_ENGINE_{module_id}] // VOL_{vol_num:02d} // H.264 // DATA_FRAGMENT")
+        r.append(f":: MOTORE: matrice_engine_{module_id} [v1.0 — {motore_tag}]" if it else
+                  f":: ENGINE: matrice_engine_{module_id} [v1.0 — {motore_tag}]")
+        r.append(f":: EFFETTO: {meta['effetto']} — Regola {params['rule']}" if it else
+                  f":: EFFECT: {meta['effetto']} — Rule {params['rule']}")
+        r.append(f":: ANALISI: {' / '.join(analisi)}" if it else
+                  f":: ANALYSIS: {' / '.join(analisi)}")
+        r.append(f":: PROCESSO: {processo} — Fonti: {fonti_str}" if it else
+                  f":: PROCESS: {processo} — Sources: {fonti_str}")
+        r.append("")
+        r.append(f'"{quote}"')
+        r.append("")
+        r.append(":: TECHNICAL LOG SHEET:")
+        r.append(f"* File: matrice_output_{ts_clean}")
+        r.append(f"* Modulo: {module_id} — {nome}" if it else f"* Module: {module_id} — {nome}")
+        r.append(f"* Seed (utente): {params['seed']}" if it else f"* Seed (user): {params['seed']}")
+        r.append(f"* Seed effettivo: {score['seed']} (perturbato dal contenuto delle fonti esterne)" if it else
+                  f"* Effective seed: {score['seed']} (perturbed by external source content)")
+        r.append(f"* Rendering: {n_frames} frame @ {FPS}fps" if it else
+                  f"* Rendering: {n_frames} frames @ {FPS}fps")
+        r.append(f"* Risoluzione: {params['resolution']}" if it else f"* Resolution: {params['resolution']}")
+        r.append(f"* Durata: {score['duration']:.1f}s" if it else f"* Duration: {score['duration']:.1f}s")
+        if module_id == "02":
+            mosaic = score["band_mosaic"]
+            if it:
+                modo_str = "energia audio reale" if mosaic["mode"] == "audio" else "procedurale (nessun audio)"
+                r.append(f"* Mosaico: 4x3 celle (bassi/medi/alti), ogni {mosaic['block_seconds']:.1f}s, {modo_str}")
+            else:
+                modo_str = "real audio energy" if mosaic["mode"] == "audio" else "procedural (no audio)"
+                r.append(f"* Mosaic: 4x3 cells (bass/mid/treble), every {mosaic['block_seconds']:.1f}s, {modo_str}")
+        if module_id == "03":
+            n_dev = len(score["deviation_events"])
+            n_dev_audio = sum(1 for e in score["deviation_events"] if e["source"] == "audio")
+            if it:
+                r.append(f"* Deviazioni: {n_dev} totali ({n_dev_audio} da colpi audio forti, "
+                          f"{n_dev - n_dev_audio} procedurali)")
+            else:
+                r.append(f"* Deviations: {n_dev} total ({n_dev_audio} from strong audio hits, "
+                          f"{n_dev - n_dev_audio} procedural)")
+        if module_id == "04":
+            if it:
+                r.append(f"* Riproduzioni finora: {params.get('usura_count', '?')}")
+                r.append(f"* Livello usura: {params.get('usura_level', 0)*100:.0f}%")
+            else:
+                r.append(f"* Plays so far: {params.get('usura_count', '?')}")
+                r.append(f"* Wear level: {params.get('usura_level', 0)*100:.0f}%")
+        r.append(f"* Colonna sonora: {params['audio_mode']}" if it else f"* Soundtrack: {params['audio_mode']}")
+        r.append(f"* Eventi totali: {len(score['events'])}" if it else
+                  f"* Total events: {len(score['events'])}")
+        r.append(f"* Eventi Procedurali: {counts.get('ca', 0)}" if it else
+                  f"* Procedural events: {counts.get('ca', 0)}")
+        if counts.get("midi", 0) > 0:
+            r.append(f"* Eventi MIDI: {counts.get('midi', 0)}" if it else f"* MIDI events: {counts.get('midi', 0)}")
+        if counts.get("audio", 0) > 0:
+            r.append(f"* Eventi Audio: {counts.get('audio', 0)}" if it else
+                      f"* Audio events: {counts.get('audio', 0)}")
+            if it:
+                r.append(f"* Bilanciamento Frequenze: bassi {band_counts.get('bass', 0)} | "
+                          f"medi {band_counts.get('mid', 0)} | alti {band_counts.get('treble', 0)}")
+            else:
+                r.append(f"* Frequency balance: bass {band_counts.get('bass', 0)} | "
+                          f"mid {band_counts.get('mid', 0)} | treble {band_counts.get('treble', 0)}")
+        if counts.get("video", 0) > 0:
+            r.append(f"* Eventi Video (tagli scena): {counts.get('video', 0)}" if it else
+                      f"* Video events (scene cuts): {counts.get('video', 0)}")
+        r.append("")
+        r.append(f":: Regia e Algoritmo: {brand}" if it else f":: Direction and Algorithm: {brand}")
+        r.append("")
+        r.append(f"#generativeart #proceduralart #digitalminimalism {meta['hashtag']}")
+        r.append("#computationalminimalism #brutalistart #glitchart #audiovisual")
+        r.append("#experimentalvideo #beatglitch")
+        return r
+
+    righe_it = build("it")
+    righe_en = build("en")
+
+    righe = list(righe_it)
     righe.append("")
-    righe.append(f'"{meta["quote"]}"')
+    righe.append(":: ENGLISH VERSION " + "-" * 40)
     righe.append("")
-    righe.append(":: TECHNICAL LOG SHEET:")
-    righe.append(f"* File: matrice_output_{params['timestamp'].replace('/', '').replace(':', '').replace(' ', '_')}")
-    righe.append(f"* Modulo: {module_id} — {meta['nome']}")
-    righe.append(f"* Seed (utente): {params['seed']}")
-    righe.append(f"* Seed effettivo: {score['seed']} (perturbato dal contenuto delle fonti esterne)")
-    righe.append(f"* Rendering: {n_frames} frame @ {FPS}fps")
-    righe.append(f"* Risoluzione: {params['resolution']}")
-    righe.append(f"* Durata: {score['duration']:.1f}s")
-    if module_id == "02":
-        mosaic = score["band_mosaic"]
-        modo_str = "energia audio reale" if mosaic["mode"] == "audio" else "procedurale (nessun audio)"
-        righe.append(f"* Mosaico: 4x3 celle (bassi/medi/alti), ogni {mosaic['block_seconds']:.1f}s, {modo_str}")
-    if module_id == "03":
-        n_dev = len(score["deviation_events"])
-        n_dev_audio = sum(1 for e in score["deviation_events"] if e["source"] == "audio")
-        righe.append(f"* Deviazioni: {n_dev} totali ({n_dev_audio} da colpi audio forti, "
-                      f"{n_dev - n_dev_audio} procedurali)")
-    if module_id == "04":
-        righe.append(f"* Riproduzioni finora: {params.get('usura_count', '?')}")
-        righe.append(f"* Livello usura: {params.get('usura_level', 0)*100:.0f}%")
-    righe.append(f"* Colonna sonora: {params['audio_mode']}")
-    righe.append(f"* Eventi totali: {len(score['events'])}")
-    righe.append(f"* Eventi Procedurali: {counts.get('ca', 0)}")
-    if counts.get("midi", 0) > 0:
-        righe.append(f"* Eventi MIDI: {counts.get('midi', 0)}")
-    if counts.get("audio", 0) > 0:
-        righe.append(f"* Eventi Audio: {counts.get('audio', 0)}")
-        righe.append(f"* Bilanciamento Frequenze: bassi {band_counts.get('bass', 0)} | "
-                      f"medi {band_counts.get('mid', 0)} | alti {band_counts.get('treble', 0)}")
-    if counts.get("video", 0) > 0:
-        righe.append(f"* Eventi Video (tagli scena): {counts.get('video', 0)}")
-    righe.append("")
-    righe.append(f":: Regia e Algoritmo: {brand}")
-    righe.append("")
-    righe.append(f"#generativeart #proceduralart #digitalminimalism {meta['hashtag']}")
-    righe.append("#computationalminimalism #brutalistart #glitchart #audiovisual")
-    righe.append("#experimentalvideo #beatglitch")
+    righe += righe_en
 
     return "\n".join(righe)
 
@@ -1959,7 +2048,7 @@ with st.sidebar:
         ORIENTAMENTI_07 = {"Verticale": "verticale", "Orizzontale": "orizzontale",
                             "Verticale + Orizzontale": "misto"}
         orientamento = ORIENTAMENTI_07[orientamento_label_07]
-        num_lanes = st.slider("Numero di corsie", 1, 60, 20, key="num_lanes_07")
+        num_lanes = st.slider("Numero di corsie", 1, 120, 30, key="num_lanes_07")
         posizione_label_07 = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
                                        horizontal=True, key="posizione_07")
         position_mode = "pan" if posizione_label_07 == "Pan stereo reale" else "frequenza"
@@ -2158,16 +2247,15 @@ if st.button("🚀 GENERA", use_container_width=True):
 if "result" in st.session_state:
     res = st.session_state["result"]
 
-    # embed diretto con larghezza fissa in pixel — più affidabile del CSS su st.video,
-    # che su alcune versioni di Streamlit viene sovrascritto dallo stile di default
-    with open(res["video_path"], "rb") as f:
-        video_b64 = base64.b64encode(f.read()).decode()
-    st.markdown(
-        f'<div style="text-align:center">'
-        f'<video width="360" controls src="data:video/mp4;base64,{video_b64}"></video>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    # st.video serve il file tramite l'endpoint media di Streamlit invece di
+    # incorporarlo come base64 nel messaggio: con usura/distruzione alta il file
+    # è molto più pesante (rumore ad alta entropia = compressione H.264 inefficace)
+    # e l'embed base64 poteva superare il limite di dimensione messaggio, dando
+    # errore. st.video non ha questo limite.
+    col_v1, col_v2, col_v3 = st.columns([1, 2, 1])
+    with col_v2:
+        with open(res["video_path"], "rb") as f:
+            st.video(f.read())
 
     col_dl1, col_dl2 = st.columns(2)
     with open(res["video_path"], "rb") as f:
