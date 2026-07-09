@@ -1310,28 +1310,22 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
                        position_mode="pan"):
     """Matrice 09: l'unica con una TOPOLOGIA FISSA — nodi e collegamenti non
     nascono, non scorrono, non decadono: sono sempre gli stessi per tutta la
-    durata, appena visibili come un circuito spento. Un evento non disegna un
-    oggetto proprio: accende il nodo più vicino alla sua posizione e l'impulso
-    si propaga per un istante lungo i collegamenti vicini, come corrente in un
-    circuito — poi si spegne e la rete torna quieta. 'Numero di linee' qui è il
-    numero di nodi della rete."""
+    durata, e restano completamente INVISIBILI finché nessun evento li tocca (il
+    fotogramma è nero puro fuori dagli eventi). Un evento non disegna un oggetto
+    proprio: accende il nodo più vicino alla sua posizione e l'impulso si propaga
+    per un istante lungo i collegamenti vicini, come corrente in un circuito —
+    poi si spegne e torna tutto nero. 'Numero di linee' qui è il numero di nodi
+    della rete."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     duration = max(score["duration"], 1e-6)
-    res = len(score["macro_envelope"])
-    env_idx = min(res - 1, int((t / duration) * res))
-    macro_v = float(score["macro_envelope"][env_idx])
 
     n_nodes = max(3, int(num_lanes) * 4)
     positions, edges, neighbors = _network_topology(int(score["seed"]), n_nodes)
     px = (positions[:, 0] * width).astype(int)
     py = (positions[:, 1] * height).astype(int)
 
-    # circuito spento ma ben visibile: archi e nodi sempre presenti, non nascosti
-    dim = int(30 + macro_v * 20)
-    for (a, b) in edges:
-        cv2.line(frame, (px[a], py[a]), (px[b], py[b]), (dim, dim, dim), 1, cv2.LINE_AA)
-    for i in range(n_nodes):
-        cv2.circle(frame, (px[i], py[i]), 4, (dim + 30, dim + 30, dim + 30), -1, cv2.LINE_AA)
+    # rete spenta completamente invisibile: nessun disegno di nodi/archi statici —
+    # si vede solo ciò che si accende a tempo con la musica
 
     SILENCE_THRESHOLD = 0.06
     gate_env = score.get("silence_envelope")
@@ -1357,8 +1351,12 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
         origin = int(np.argmin(d))
 
         origin_c = tuple(int(c * fade) for c in color)
-        r_origin = max(3, int(4 + 8 * e["vel"] * fade))
+        r_origin = max(7, int(9 + 12 * e["vel"] * fade))
         cv2.circle(frame, (px[origin], py[origin]), r_origin, origin_c, -1, cv2.LINE_AA)
+        # alone esterno: rende il nodo acceso riconoscibile a colpo d'occhio, non
+        # confondibile con i nodi spenti della rete
+        halo_c = tuple(int(c * fade * 0.5) for c in color)
+        cv2.circle(frame, (px[origin], py[origin]), r_origin + 4, halo_c, 2, cv2.LINE_AA)
 
         # propagazione dell'impulso per 2 salti lungo la rete, con decadimento
         visited = {origin: 0}
@@ -1379,10 +1377,10 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
             if hop_fade <= 0:
                 continue
             c = tuple(int(c * hop_fade) for c in color)
-            cv2.circle(frame, (px[node], py[node]), max(2, int(3 * hop_fade)), c, -1, cv2.LINE_AA)
+            cv2.circle(frame, (px[node], py[node]), max(4, int(7 * hop_fade)), c, -1, cv2.LINE_AA)
             for nb in neighbors.get(node, []):
                 if visited.get(nb, 99) < hop:
-                    cv2.line(frame, (px[node], py[node]), (px[nb], py[nb]), c, 1, cv2.LINE_AA)
+                    cv2.line(frame, (px[node], py[node]), (px[nb], py[nb]), c, 2, cv2.LINE_AA)
 
     return frame
 
@@ -2217,9 +2215,9 @@ elif module_id == "08":
                "di Lissajous) si disegna con una scia fosforescente; gli eventi "
                "colorano solo il tratto di curva corrispondente al loro istante.")
 elif module_id == "09":
-    st.caption("Modulo 09: l'unica rete a topologia fissa. Nodi e collegamenti non "
-               "cambiano mai forma — restano un circuito spento finché un evento non "
-               "accende il nodo più vicino e la corrente si propaga lungo la rete.")
+    st.caption("Modulo 09: l'unica rete a topologia fissa. Nodi e collegamenti "
+               "restano invisibili (nero puro) finché un evento non accende il "
+               "nodo più vicino e la corrente si propaga lungo la rete.")
 elif module_id == "10":
     st.caption("Modulo 10: tre anelli concentrici (bassi/medi/alti) pulsano sempre, "
                "in continuo, con l'energia reale delle tre bande — non solo ai colpi. "
@@ -2549,9 +2547,9 @@ with st.sidebar:
         # Modulo 09: unica matrice a topologia fissa — nodi e archi non cambiano
         # mai posizione. 'Numero di linee' qui è il numero di nodi della rete
         # (moltiplicato internamente per una densità di collegamenti fissa).
-        st.caption("La rete resta sempre la stessa forma: appena visibile finché un "
-                   "evento non accende il nodo più vicino e la corrente si propaga "
-                   "lungo i collegamenti vicini.")
+        st.caption("La rete resta invisibile (nero puro) finché un evento non "
+                   "accende il nodo più vicino e la corrente si propaga lungo i "
+                   "collegamenti vicini.")
         orientamento_label_09 = st.radio("Assi corsia/banda", ["Standard", "Assi scambiati"],
                                           horizontal=True, key="orientamento_09")
         orientamento = "verticale" if orientamento_label_09 == "Standard" else "orizzontale"
