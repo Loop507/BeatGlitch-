@@ -1290,7 +1290,7 @@ def _network_topology(seed, n_nodes):
     diff = positions[:, None, :] - positions[None, :, :]
     dist = np.sqrt((diff ** 2).sum(axis=2))
     np.fill_diagonal(dist, np.inf)
-    k = 3
+    k = 4
     order = np.argsort(dist, axis=1)
     edges = set()
     for i in range(n_nodes):
@@ -1326,12 +1326,12 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
     px = (positions[:, 0] * width).astype(int)
     py = (positions[:, 1] * height).astype(int)
 
-    # circuito spento: archi e nodi appena visibili, sempre presenti
-    dim = int(8 + macro_v * 6)
+    # circuito spento ma ben visibile: archi e nodi sempre presenti, non nascosti
+    dim = int(30 + macro_v * 20)
     for (a, b) in edges:
         cv2.line(frame, (px[a], py[a]), (px[b], py[b]), (dim, dim, dim), 1, cv2.LINE_AA)
     for i in range(n_nodes):
-        cv2.circle(frame, (px[i], py[i]), 2, (dim + 6, dim + 6, dim + 6), -1, cv2.LINE_AA)
+        cv2.circle(frame, (px[i], py[i]), 4, (dim + 30, dim + 30, dim + 30), -1, cv2.LINE_AA)
 
     SILENCE_THRESHOLD = 0.06
     gate_env = score.get("silence_envelope")
@@ -1414,18 +1414,24 @@ def render_frame_radiale(t, score, width=960, height=540, orientation="verticale
     ring_r_by_band = {}
     for band_name, rel_r, spikes in rings:
         val = _band_block_value(mosaic[band_name], mode, block_seconds, t)
-        ring_r = base_r * rel_r * (0.7 + 0.6 * val)
+        ring_r = base_r * rel_r * (0.45 + 1.3 * val)  # escursione molto più marcata
         ring_r_by_band[band_name] = ring_r
         base_color = bc.get(band_name, (140, 140, 150))
         shade = 0.35 + 0.65 * val
         color = tuple(int(ch * shade) for ch in base_color)
 
-        angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
-        wob = 1.0 + 0.06 * val * np.sin(angles * spikes + t * 1.3 + seed * 0.01)
+        if orientation == "orizzontale":
+            angles = np.linspace(0, np.pi, n_points)  # semicerchio: solo metà anello
+            closed = False
+        else:
+            angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)  # cerchio completo
+            closed = True
+
+        wob = 1.0 + 0.20 * val * np.sin(angles * spikes + t * 1.3 + seed * 0.01)
         xs = (cx + ring_r * wob * np.cos(angles)).astype(np.int32)
         ys = (cy + ring_r * wob * np.sin(angles)).astype(np.int32)
         pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
-        cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+        cv2.polylines(frame, [pts], isClosed=closed, color=color, thickness=3, lineType=cv2.LINE_AA)
 
     active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
     for e in active:
@@ -1443,10 +1449,10 @@ def render_frame_radiale(t, score, width=960, height=540, orientation="verticale
             ang = 2 * np.pi * min(0.999, max(0.0, _lane_fraction(e, position_mode)))
 
         ring_r = ring_r_by_band[band_name]
-        spike_r = ring_r * (1.0 + 0.5 * e["vel"] * fade)
+        spike_r = ring_r * (1.0 + 1.1 * e["vel"] * fade)  # guizzo più lungo e visibile
         x0, y0 = int(cx + ring_r * np.cos(ang)), int(cy + ring_r * np.sin(ang))
         x1, y1 = int(cx + spike_r * np.cos(ang)), int(cy + spike_r * np.sin(ang))
-        cv2.line(frame, (x0, y0), (x1, y1), c, max(2, int(2 + 3 * fade)), cv2.LINE_AA)
+        cv2.line(frame, (x0, y0), (x1, y1), c, max(3, int(3 + 4 * fade)), cv2.LINE_AA)
 
     return frame
 
@@ -2549,7 +2555,7 @@ with st.sidebar:
         orientamento_label_09 = st.radio("Assi corsia/banda", ["Standard", "Assi scambiati"],
                                           horizontal=True, key="orientamento_09")
         orientamento = "verticale" if orientamento_label_09 == "Standard" else "orizzontale"
-        num_lanes = st.slider("Numero di nodi", 3, 60, 15, key="num_lanes_09")
+        num_lanes = st.slider("Numero di nodi", 3, 100, 20, key="num_lanes_09")
         posizione_label_09 = st.radio("Posizione sulla rete", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
                                        horizontal=True, key="posizione_09")
         position_mode = "pan" if posizione_label_09 == "Pan stereo reale" else "frequenza"
@@ -2578,11 +2584,12 @@ with st.sidebar:
         # Modulo 10: tre anelli concentrici sempre pulsanti con l'energia reale di
         # bassi/medi/alti. 'Numero di linee' qui è la risoluzione angolare degli
         # anelli (quanti segmenti li compongono).
-        st.caption("Gli anelli pulsano sempre con le tre bande, anche senza eventi. "
+        st.caption("Gli anelli pulsano sempre con le tre bande, anche senza eventi — "
+                   "più forte è l'energia della banda, più l'anello si allarga. "
                    "'Numero di linee' qui regola la risoluzione angolare degli anelli.")
-        orientamento_label_10 = st.radio("Copertura guizzi evento", ["Cerchio completo (360°)", "Semicerchio (180°)"],
+        orientamento_label_10 = st.radio("Forma anelli", ["Cerchio completo", "Semicerchio"],
                                           horizontal=True, key="orientamento_10")
-        orientamento = "verticale" if orientamento_label_10 == "Cerchio completo (360°)" else "orizzontale"
+        orientamento = "verticale" if orientamento_label_10 == "Cerchio completo" else "orizzontale"
         num_lanes = st.slider("Risoluzione anelli", 20, 120, 40, key="num_lanes_10")
         posizione_label_10 = st.radio("Posizione guizzi", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
                                        horizontal=True, key="posizione_10")
