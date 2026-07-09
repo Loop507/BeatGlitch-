@@ -1096,7 +1096,7 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
 
             x = int(col * col_w + col_w * 0.25)
             for row in range(n_rows):
-                if picks[row] > 0.55:
+                if picks[row] > 0.85:
                     continue
                 y = int((row - offset) * char_h)
                 if y < char_h or y > height:
@@ -1122,7 +1122,7 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
 
             y = int(lane * row_h + row_h * 0.6)
             for col in range(n_cols):
-                if picks[col] > 0.55:
+                if picks[col] > 0.85:
                     continue
                 x = int((col - offset) * char_h)
                 if x < char_h or x > width:
@@ -1959,7 +1959,7 @@ with st.sidebar:
         ORIENTAMENTI_07 = {"Verticale": "verticale", "Orizzontale": "orizzontale",
                             "Verticale + Orizzontale": "misto"}
         orientamento = ORIENTAMENTI_07[orientamento_label_07]
-        num_lanes = st.slider("Numero di corsie", 1, 24, 10, key="num_lanes_07")
+        num_lanes = st.slider("Numero di corsie", 1, 60, 20, key="num_lanes_07")
         posizione_label_07 = st.radio("Posizione orizzontale", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
                                        horizontal=True, key="posizione_07")
         position_mode = "pan" if posizione_label_07 == "Pan stereo reale" else "frequenza"
