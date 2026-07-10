@@ -1173,14 +1173,14 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, 
 def render_frame_datastream(t, score, width=960, height=540, orientation="verticale",
                              num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
                              position_mode="pan"):
-    """Matrice 07: nessuna forma geometrica — un FLUSSO DI CARATTERI monospace che
-    scorre in colonne (o righe) continue, come un readout che non si ferma mai.
-    Ogni corsia scorre da sé indipendentemente dagli eventi (glifi radi, in grigio
-    spento); quando un evento è attivo in quella corsia, i suoi caratteri si
-    accendono col colore dell'evento. In modalità 'misto' verticale e orizzontale
-    convivono nello STESSO fotogramma (corsie pari = colonne, corsie dispari =
-    righe), non alternati nel tempo. Nessuna barra, nessun blocco: solo simboli
-    che cadono."""
+    """Matrice 07: nessuna forma geometrica — una GRIGLIA DENSA di caratteri
+    monospace riempie tutta la larghezza/altezza (nessun vuoto tra le colonne),
+    come un readout che non si ferma mai. Ogni STRISCIA (gruppo di colonne/righe
+    dense contigue, una per 'corsia' audio-reattiva) scorre da sé; quando un
+    evento è attivo nella sua corsia, l'intera striscia — non un solo carattere
+    — si accende col colore dell'evento. In modalità 'misto' strisce verticali
+    e orizzontali convivono nello stesso fotogramma. Nessuna barra, nessun
+    blocco: solo simboli che cadono, fitti, a coprire tutta la scena."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     duration = max(score["duration"], 1e-6)
     res = len(score["macro_envelope"])
@@ -1197,6 +1197,7 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     num_lanes = max(1, int(num_lanes))
     glyphs = "0123456789ABCDEFXZNMTYJHKLQR#%&@*+=<>"
     char_h = max(10, height // 28)
+    char_w = max(6, int(char_h * 0.62))  # spaziatura fitta: colonne/righe dense, senza vuoti
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.3, char_h / 28.0)
     base_gray = int(28 + macro_v * 18)
@@ -1209,35 +1210,49 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
                 lane_idx = int(lane_frac * num_lanes)
                 active_by_lane.setdefault(lane_idx, []).append(e)
 
-    if orientation == "verticale":
-        vertical_lanes, horizontal_lanes = list(range(num_lanes)), []
-    elif orientation == "orizzontale":
-        vertical_lanes, horizontal_lanes = [], list(range(num_lanes))
-    else:  # misto: convivono nello stesso fotogramma, corsie pari/dispari
-        vertical_lanes = [i for i in range(num_lanes) if i % 2 == 0]
-        horizontal_lanes = [i for i in range(num_lanes) if i % 2 == 1]
+    def _lane_color(lane_idx):
+        active_events = active_by_lane.get(lane_idx, [])
+        return get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
+            if active_events else None
 
     scroll_speed = 6.0 + macro_v * 10.0  # celle al secondo
     offset = (t * scroll_speed) % 1.0
     time_step = int(t * scroll_speed)
-    col_w = width / num_lanes
-    row_h = height / num_lanes
     n_rows = int(height / char_h) + 2
     n_cols = int(width / char_h) + 2
 
-    for col in vertical_lanes:
-        active_events = active_by_lane.get(col, [])
-        lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
-            if active_events else None
-        _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step, glyphs,
-                                 font, font_scale, base_gray, lane_color, height)
+    n_cols_dense = max(num_lanes, int(width / char_w))
+    n_rows_dense = max(num_lanes, int(height / char_w))
+    col_span = max(1, n_cols_dense // num_lanes)
+    row_span = max(1, n_rows_dense // num_lanes)
 
-    for lane in horizontal_lanes:
-        active_events = active_by_lane.get(lane, [])
-        lane_color = get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
-            if active_events else None
-        _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, glyphs,
-                              font, font_scale, base_gray, lane_color, width)
+    if orientation == "verticale":
+        for col in range(n_cols_dense):
+            lane_idx = min(num_lanes - 1, col // col_span)
+            lane_color = _lane_color(lane_idx)
+            _datastream_draw_column(frame, col, char_w, n_rows, char_h, offset, time_step, glyphs,
+                                     font, font_scale, base_gray, lane_color, height)
+    elif orientation == "orizzontale":
+        for row in range(n_rows_dense):
+            lane_idx = min(num_lanes - 1, row // row_span)
+            lane_color = _lane_color(lane_idx)
+            _datastream_draw_row(frame, row, char_w, n_cols, char_h, offset, time_step, glyphs,
+                                  font, font_scale, base_gray, lane_color, width)
+    else:  # misto: strisce verticali e orizzontali convivono nello stesso fotogramma
+        for col in range(n_cols_dense):
+            lane_idx = min(num_lanes - 1, col // col_span)
+            if lane_idx % 2 != 0:
+                continue
+            lane_color = _lane_color(lane_idx)
+            _datastream_draw_column(frame, col, char_w, n_rows, char_h, offset, time_step, glyphs,
+                                     font, font_scale, base_gray, lane_color, height)
+        for row in range(n_rows_dense):
+            lane_idx = min(num_lanes - 1, row // row_span)
+            if lane_idx % 2 == 0:
+                continue
+            lane_color = _lane_color(lane_idx)
+            _datastream_draw_row(frame, row, char_w, n_cols, char_h, offset, time_step, glyphs,
+                                  font, font_scale, base_gray, lane_color, width)
 
     return frame
 
