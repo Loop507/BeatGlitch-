@@ -1150,8 +1150,18 @@ def render_frame_automaton(t, score, width=960, height=540, orientation="vertica
     return frame
 
 
-def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step, glyphs,
+def _datastream_draw_column(frame, col, col_w, n_rows, char_h, t, scroll_speed_base, glyphs,
                              font, font_scale, base_gray, lane_color, height, cycle_len=9):
+    # velocità e fase PROPRIE della colonna (stabili nel tempo, diverse da colonna
+    # a colonna): è questo che rompe l'effetto "blocco che si muove all'unisono" —
+    # ogni striscia di dati cade per conto suo, come nel riferimento reale
+    rng_speed = np.random.RandomState((col * 7793 + 12345) & 0x7FFFFFFF)
+    speed_mult = 0.55 + rng_speed.random() * 0.9
+    phase0 = rng_speed.random()
+    own_speed = scroll_speed_base * speed_mult
+    offset = (t * own_speed + phase0) % 1.0
+    time_step = int(t * own_speed + phase0 * 1000)
+
     seed_c = (col * 9973 + time_step) & 0x7FFFFFFF
     rng_c = np.random.RandomState(seed_c)
     picks = rng_c.random(n_rows)
@@ -1175,8 +1185,15 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step
         cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
-def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, glyphs,
+def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, t, scroll_speed_base, glyphs,
                           font, font_scale, base_gray, lane_color, width, cycle_len=9):
+    rng_speed = np.random.RandomState((lane * 7793 + 54321) & 0x7FFFFFFF)
+    speed_mult = 0.55 + rng_speed.random() * 0.9
+    phase0 = rng_speed.random()
+    own_speed = scroll_speed_base * speed_mult
+    offset = (t * own_speed + phase0) % 1.0
+    time_step = int(t * own_speed + phase0 * 1000)
+
     seed_c = (lane * 9973 + time_step) & 0x7FFFFFFF
     rng_c = np.random.RandomState(seed_c)
     picks = rng_c.random(n_cols)
@@ -1253,8 +1270,6 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     # comunque una modulazione sopra questa base
     beat_interval = score.get("beat_interval") or 0.5
     scroll_speed = (2.0 / beat_interval) * (0.7 + 0.6 * macro_v)
-    offset = (t * scroll_speed) % 1.0
-    time_step = int(t * scroll_speed)
     n_rows = int(height / char_h) + 2
     n_cols = int(width / char_h) + 2
 
@@ -1267,13 +1282,13 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
         for col in range(n_cols_dense):
             lane_idx = min(num_lanes - 1, col // col_span)
             lane_color = _lane_color(lane_idx)
-            _datastream_draw_column(frame, col, char_w, n_rows, char_h, offset, time_step, glyphs,
+            _datastream_draw_column(frame, col, char_w, n_rows, char_h, t, scroll_speed, glyphs,
                                      font, font_scale, base_gray, lane_color, height)
     elif orientation == "orizzontale":
         for row in range(n_rows_dense):
             lane_idx = min(num_lanes - 1, row // row_span)
             lane_color = _lane_color(lane_idx)
-            _datastream_draw_row(frame, row, char_w, n_cols, char_h, offset, time_step, glyphs,
+            _datastream_draw_row(frame, row, char_w, n_cols, char_h, t, scroll_speed, glyphs,
                                   font, font_scale, base_gray, lane_color, width)
     else:  # misto: strisce verticali e orizzontali convivono nello stesso fotogramma
         for col in range(n_cols_dense):
@@ -1281,14 +1296,14 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
             if lane_idx % 2 != 0:
                 continue
             lane_color = _lane_color(lane_idx)
-            _datastream_draw_column(frame, col, char_w, n_rows, char_h, offset, time_step, glyphs,
+            _datastream_draw_column(frame, col, char_w, n_rows, char_h, t, scroll_speed, glyphs,
                                      font, font_scale, base_gray, lane_color, height)
         for row in range(n_rows_dense):
             lane_idx = min(num_lanes - 1, row // row_span)
             if lane_idx % 2 == 0:
                 continue
             lane_color = _lane_color(lane_idx)
-            _datastream_draw_row(frame, row, char_w, n_cols, char_h, offset, time_step, glyphs,
+            _datastream_draw_row(frame, row, char_w, n_cols, char_h, t, scroll_speed, glyphs,
                                   font, font_scale, base_gray, lane_color, width)
 
     return frame
