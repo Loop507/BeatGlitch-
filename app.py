@@ -1142,7 +1142,7 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step
         # capofila più acceso seguito da una scia che si affievolisce, invece di
         # glifi tutti alla stessa intensità — è questo che fa "sentire" la caduta
         wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (row - offset) / cycle_len))
-        base_color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
+        base_color = lane_color if (lane_color is not None and color_pick[row] < 0.85) else \
             (base_gray, base_gray, base_gray)
         color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
         cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
@@ -1164,7 +1164,7 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, 
         if x < char_h or x > width:
             continue
         wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (col - offset) / cycle_len))
-        base_color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
+        base_color = lane_color if (lane_color is not None and color_pick[col] < 0.85) else \
             (base_gray, base_gray, base_gray)
         color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
         cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
@@ -1210,10 +1210,15 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
                 lane_idx = int(lane_frac * num_lanes)
                 active_by_lane.setdefault(lane_idx, []).append(e)
 
+    spread = max(1, num_lanes // 6)  # quante corsie vicine "prendono" il colore di una corsia attiva
+
     def _lane_color(lane_idx):
-        active_events = active_by_lane.get(lane_idx, [])
-        return get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors) \
-            if active_events else None
+        for d in range(0, spread + 1):
+            for cand in ({lane_idx - d, lane_idx + d} if d else {lane_idx}):
+                active_events = active_by_lane.get(cand)
+                if active_events:
+                    return get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors)
+        return None
 
     scroll_speed = 6.0 + macro_v * 10.0  # celle al secondo
     offset = (t * scroll_speed) % 1.0
