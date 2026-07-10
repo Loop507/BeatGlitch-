@@ -512,7 +512,17 @@ def extract_from_audio(audio_path):
     events.sort(key=lambda e: e["t"])
 
     env = rms / (rms.max() + 1e-9)
-    return events, env, duration, y_stereo, band_envelopes
+
+    # rilevamento BPM reale — usato da più matrici per calibrare le proprie
+    # cadenze sul tempo VERO del brano, invece di costanti fisse in secondi
+    try:
+        tempo, _ = librosa.beat.beat_track(y=y_mono, sr=sr)
+        tempo_val = float(np.asarray(tempo).reshape(-1)[0]) if np.asarray(tempo).size > 0 else 0.0
+        bpm = tempo_val if tempo_val > 0 else None
+    except Exception:
+        bpm = None
+
+    return events, env, duration, y_stereo, band_envelopes, bpm
 
 
 def extract_from_video(video_path):
@@ -565,7 +575,7 @@ def build_score(duration, seed, rule=30,
                  audio_events=None, audio_env=None,
                  video_events=None, video_env=None, audio_band_envelopes=None,
                  resolution=200, macro_block_seconds=3.0, deviation_strong_threshold=0.72,
-                 deviation_min_gap=1.0):
+                 deviation_min_gap=1.0, bpm=None):
     has_external = bool(midi_events or audio_events or video_events)
 
     # il seed "di base" pilotato dall'utente resta riproducibile, ma viene perturbato
@@ -629,14 +639,29 @@ def build_score(duration, seed, rule=30,
 
     texture = generate_micro_texture_procedural(resolution * 4, effective_seed)
 
+    # BPM reale (se rilevato dall'audio) → intervallo di un battito in secondi.
+    # Senza rilevamento (nessun audio, o audio troppo atonale per un BPM affidabile)
+    # si assume un'ipotesi neutra di 120 BPM, così il comportamento resta coerente
+    # anche in modalità puramente procedurale — condiviso da più matrici.
+    beat_interval = (60.0 / bpm) if (bpm and bpm > 0) else (60.0 / 120.0)
+
+    # distanza minima tra deviazioni (Molnár) espressa in BATTITI reali, non più
+    # secondi assoluti: un brano veloce (es. techno) ha battiti corti → deviazioni
+    # più ravvicinate in automatico; uno lento le tiene naturalmente più diradate
+    effective_deviation_min_gap = max(0.08, deviation_min_gap * beat_interval)
+
     deviation_events = generate_deviation_events(
         duration, effective_seed, audio_events=audio_events, block_seconds=macro_block_seconds,
-        strong_threshold=deviation_strong_threshold, min_gap=deviation_min_gap,
+        strong_threshold=deviation_strong_threshold, min_gap=effective_deviation_min_gap,
     )
 
     # campo automa cellulare 2D dedicato (modulo 06): non serve a generare eventi,
-    # è esso stesso il "tessuto" visivo/sonoro che scorre e muta nel tempo
-    automaton_steps = max(30, int(duration * 10))
+    # è esso stesso il "tessuto" visivo/sonoro che scorre e muta nel tempo — la sua
+    # cadenza è agganciata al battito reale (5 "generazioni" per battito), non a un
+    # ritmo fisso: un brano veloce fa mutare il tessuto più in fretta, uno lento più
+    # lentamente
+    steps_per_beat = 5.0
+    automaton_steps = max(30, int((duration / beat_interval) * steps_per_beat))
     automaton_field = cellular_automaton(rule, width=140, steps=automaton_steps, seed=effective_seed + 909)
 
     return {
@@ -650,6 +675,8 @@ def build_score(duration, seed, rule=30,
         "silence_envelope": silence_envelope,
         "micro_texture": texture,
         "automaton_field": automaton_field,
+        "bpm": bpm,
+        "beat_interval": beat_interval,
     }
 
 
@@ -1220,7 +1247,12 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
                     return get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors)
         return None
 
-    scroll_speed = 6.0 + macro_v * 10.0  # celle al secondo
+    # velocità di scorrimento agganciata al battito reale: 2 celle per battito come
+    # base, invece di una costante arbitraria — un brano veloce fa scorrere il
+    # flusso più in fretta, uno lento più adagio; l'energia del brano aggiunge
+    # comunque una modulazione sopra questa base
+    beat_interval = score.get("beat_interval") or 0.5
+    scroll_speed = (2.0 / beat_interval) * (0.7 + 0.6 * macro_v)
     offset = (t * scroll_speed) % 1.0
     time_step = int(t * scroll_speed)
     n_rows = int(height / char_h) + 2
@@ -1289,6 +1321,13 @@ def render_frame_oscilloscopio(t, score, width=960, height=540, orientation="ver
     freq_y = 2 + ((seed // 5) % 5)
     phase_shift = t * (0.03 + 0.05 * macro_v)
 
+    # frequenza base agganciata al battito reale: un ciclo completo dell'unità di
+    # base corrisponde a una battuta intera (4 battiti), invece di una costante
+    # arbitraria — freq_x/freq_y restano i rapporti armonici che danno la forma
+    # della figura, ma il suo "passo" ora è quello vero del brano
+    beat_interval = score.get("beat_interval") or 0.5
+    base_rate = 1.0 / (beat_interval * 4.0)
+
     n_lanes = max(1, int(num_lanes))
     n_trail = max(24, n_lanes * 12)
     trail_span = 0.6
@@ -1304,8 +1343,8 @@ def render_frame_oscilloscopio(t, score, width=960, height=540, orientation="ver
         if tt < 0:
             continue
         ax, ay = amp_x * amp_scale, amp_y * amp_scale
-        x = cx + ax * np.sin(2 * np.pi * freq_x * tt * 0.5 + phase_shift)
-        y = cy + ay * np.sin(2 * np.pi * freq_y * tt * 0.5 + phase_shift * 1.3 + 0.7)
+        x = cx + ax * np.sin(2 * np.pi * freq_x * tt * base_rate + phase_shift)
+        y = cy + ay * np.sin(2 * np.pi * freq_y * tt * base_rate + phase_shift * 1.3 + 0.7)
         alpha = (1.0 - frac) ** 2
 
         seg_color = None
@@ -1476,7 +1515,10 @@ def render_frame_radiale(t, score, width=960, height=540, orientation="verticale
             angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)  # cerchio completo
             closed = True
 
-        wob = 1.0 + 0.20 * val * np.sin(angles * spikes + t * 1.3 + seed * 0.01)
+        # pulsazione agganciata al battito reale: un ciclo completo ogni battito,
+        # invece di una velocità costante scollegata dal tempo del brano
+        beat_interval = score.get("beat_interval") or 0.5
+        wob = 1.0 + 0.20 * val * np.sin(angles * spikes + (t / beat_interval) * 2 * np.pi + seed * 0.01)
         xs = (cx + ring_r * wob * np.cos(angles)).astype(np.int32)
         ys = (cy + ring_r * wob * np.sin(angles)).astype(np.int32)
         pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
@@ -2138,6 +2180,11 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
                   f"* Rendering: {n_frames} frames @ {FPS}fps")
         r.append(f"* Risoluzione: {params['resolution']}" if it else f"* Resolution: {params['resolution']}")
         r.append(f"* Durata: {score['duration']:.1f}s" if it else f"* Duration: {score['duration']:.1f}s")
+        if score.get("bpm"):
+            r.append(f"* BPM rilevato: {score['bpm']:.1f}" if it else f"* Detected BPM: {score['bpm']:.1f}")
+        else:
+            r.append("* BPM: non rilevato (ipotesi neutra 120 BPM per le cadenze)" if it else
+                      "* BPM: not detected (neutral 120 BPM assumption used for cadences)")
         if module_id == "02":
             mosaic = score["band_mosaic"]
             if it:
@@ -2388,9 +2435,11 @@ with st.sidebar:
                  "Più alto = solo i colpi davvero più forti (più rare)."
         )
         deviation_min_gap = st.slider(
-            "Distanza minima tra deviazioni (s)", 0.15, 2.0, 1.0, step=0.05,
-            help="Abbassala per brani veloci (es. house/techno): a 1.0s le deviazioni "
-                 "non possono seguire una cassa più rapida di 60 bpm."
+            "Distanza minima tra deviazioni (in battiti)", 0.25, 4.0, 1.0, step=0.25,
+            help="Calibrata sul BPM reale rilevato dall'audio caricato: un valore di 1.0 "
+                 "significa 'non prima di un battito'. Un brano veloce (es. techno) avrà "
+                 "quindi deviazioni più ravvicinate in automatico, uno lento più diradate. "
+                 "Senza audio (o BPM non rilevato) si assume un'ipotesi neutra di 120 BPM."
         )
 
         def _hex_to_rgb(h):
@@ -2671,6 +2720,7 @@ with st.sidebar:
 midi_events, audio_events, audio_env, video_events, video_env = None, None, None, None, None
 audio_raw = None
 audio_band_envelopes = None
+detected_bpm = None
 durations = []
 
 def save_upload(f, suffix):
@@ -2689,9 +2739,12 @@ if midi_file:
 if audio_file:
     with st.spinner("Estrazione onset/energia da audio..."):
         audio_path = save_upload(audio_file, os.path.splitext(audio_file.name)[1])
-        audio_events, audio_env, audio_dur, audio_raw, audio_band_envelopes = extract_from_audio(audio_path)
+        audio_events, audio_env, audio_dur, audio_raw, audio_band_envelopes, detected_bpm = extract_from_audio(audio_path)
         durations.append(audio_dur)
-        st.sidebar.success(f"Audio: {len(audio_events)} onset rilevati")
+        if detected_bpm:
+            st.sidebar.success(f"Audio: {len(audio_events)} onset rilevati — BPM stimato: {detected_bpm:.1f}")
+        else:
+            st.sidebar.success(f"Audio: {len(audio_events)} onset rilevati")
 
 if video_file:
     with st.spinner("Analisi tagli di scena/motion da video..."):
@@ -2735,16 +2788,27 @@ st.caption("Nota: questo switch cambia solo l'audio che senti. Il video reagisce
 if st.button("🚀 GENERA", use_container_width=True):
     with st.status("Costruzione matrice e rendering...", expanded=True) as status:
         st.write("Combinazione delle fonti in un'unica matrice...")
+        # blocco macro (Henke/Radiale): una battuta intera (4/4) se conosciamo il BPM
+        # reale, invece di una costante fissa in secondi — i blocchi cambiano sui
+        # tempi forti del brano, non a un ritmo arbitrario
+        macro_block_seconds_effective = (60.0 / detected_bpm) * 4 if detected_bpm else 3.0
         score = build_score(
             duration=duration, seed=int(seed), rule=rule,
             midi_events=midi_events,
             audio_events=audio_events, audio_env=audio_env,
             video_events=video_events, video_env=video_env,
             audio_band_envelopes=audio_band_envelopes,
+            macro_block_seconds=macro_block_seconds_effective,
             deviation_strong_threshold=deviation_sensitivity,
             deviation_min_gap=deviation_min_gap,
+            bpm=detected_bpm,
         )
         st.write(f"Matrice pronta — {len(score['events'])} eventi totali.")
+        if score["bpm"]:
+            st.write(f"BPM rilevato: {score['bpm']:.1f} — cadenze delle matrici calibrate su questo tempo.")
+        else:
+            st.write("Nessun BPM rilevato (audio assente o non conclusivo) — "
+                      "ipotesi neutra di 120 BPM usata per le cadenze.")
 
         st.write("Costruzione colonna sonora finale...")
         N = int(score["duration"] * SR)
