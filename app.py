@@ -248,6 +248,28 @@ def macro_block_value(macro_blocks, t):
     return float(macro_blocks["values"][idx])
 
 
+def _band_continuous_value(band_data, mode, block_seconds, t):
+    """Valore 0..1 CONTINUO (non a scatti per blocco) dell'energia di banda
+    all'istante t. A differenza di _band_block_value (voluto a gradini netti per
+    il Modulo 02), qui interpola in continuo: con audio reale segue l'inviluppo
+    campione per campione, in modalità procedurale sfuma tra i centri dei blocchi
+    invece di saltare — necessario per una Matrice 10 che risponde davvero in
+    tempo reale, non solo ogni pochi secondi."""
+    t = max(0.0, t)
+    if mode == "audio":
+        env, times = band_data["env"], band_data["times"]
+        if len(env) == 0:
+            return 0.0
+        return float(np.interp(t, times, env))
+    values = band_data["blocks"]["values"]
+    bs = band_data["blocks"]["block_seconds"]
+    n = len(values)
+    if n == 1:
+        return float(values[0])
+    centers = (np.arange(n) + 0.5) * bs
+    return float(np.interp(t, centers, values))
+
+
 def generate_deviation_events(duration, seed, audio_events=None, strong_threshold=0.72,
                                min_gap=1.0, block_seconds=3.0):
     """Eventi di deviazione RARI (Molnár): scattano solo sui colpi audio davvero forti
@@ -1123,7 +1145,7 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step
         base_color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
             (base_gray, base_gray, base_gray)
         color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
-        cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
 def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, glyphs,
@@ -1145,7 +1167,7 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, 
         base_color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
             (base_gray, base_gray, base_gray)
         color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
-        cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
 def render_frame_datastream(t, score, width=960, height=540, orientation="verticale",
@@ -1173,11 +1195,11 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
         silent = float(gate_env[gate_idx]) < SILENCE_THRESHOLD
 
     num_lanes = max(1, int(num_lanes))
-    glyphs = "01.:+*#%$?<>=/\\|^~;!ZXVNMTYJ"
+    glyphs = "0123456789ABCDEFXZNMTYJHKLQR#%&@*+=<>"
     char_h = max(10, height // 28)
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.3, char_h / 28.0)
-    base_gray = int(10 + macro_v * 14)
+    base_gray = int(28 + macro_v * 18)
 
     active_by_lane = {}
     if not silent:
@@ -1420,7 +1442,7 @@ def render_frame_radiale(t, score, width=960, height=540, orientation="verticale
 
     ring_r_by_band = {}
     for band_name, rel_r, spikes in rings:
-        val = _band_block_value(mosaic[band_name], mode, block_seconds, t)
+        val = _band_continuous_value(mosaic[band_name], mode, block_seconds, t)
         ring_r = base_r * rel_r * (0.45 + 1.3 * val)  # escursione molto più marcata
         ring_r_by_band[band_name] = ring_r
         base_color = bc.get(band_name, (140, 140, 150))
@@ -1962,9 +1984,9 @@ def synthesize_audio_radiale(score, sr=SR):
     step = 0.05
     n_steps = int(duration / step) + 2
     times_steps = np.arange(n_steps) * step
-    bass_vals = np.array([_band_block_value(mosaic["bass"], mode, block_seconds, tt) for tt in times_steps])
-    mid_vals = np.array([_band_block_value(mosaic["mid"], mode, block_seconds, tt) for tt in times_steps])
-    treble_vals = np.array([_band_block_value(mosaic["treble"], mode, block_seconds, tt) for tt in times_steps])
+    bass_vals = np.array([_band_continuous_value(mosaic["bass"], mode, block_seconds, tt) for tt in times_steps])
+    mid_vals = np.array([_band_continuous_value(mosaic["mid"], mode, block_seconds, tt) for tt in times_steps])
+    treble_vals = np.array([_band_continuous_value(mosaic["treble"], mode, block_seconds, tt) for tt in times_steps])
     bass_env = np.interp(t_ax, times_steps, bass_vals)
     mid_env = np.interp(t_ax, times_steps, mid_vals)
     treble_env = np.interp(t_ax, times_steps, treble_vals)
