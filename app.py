@@ -1102,7 +1102,7 @@ def render_frame_automaton(t, score, width=960, height=540, orientation="vertica
 
 
 def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step, glyphs,
-                             font, font_scale, base_gray, lane_color, height):
+                             font, font_scale, base_gray, lane_color, height, cycle_len=9):
     seed_c = (col * 9973 + time_step) & 0x7FFFFFFF
     rng_c = np.random.RandomState(seed_c)
     picks = rng_c.random(n_rows)
@@ -1116,13 +1116,18 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, offset, time_step
         y = int((row - offset) * char_h)
         if y < char_h or y > height:
             continue
-        color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
+        # onda di luminosità che scorre con la stessa fase dello scroll: dà un
+        # capofila più acceso seguito da una scia che si affievolisce, invece di
+        # glifi tutti alla stessa intensità — è questo che fa "sentire" la caduta
+        wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (row - offset) / cycle_len))
+        base_color = lane_color if (lane_color is not None and color_pick[row] < 0.6) else \
             (base_gray, base_gray, base_gray)
+        color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
         cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
 
 
 def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, glyphs,
-                          font, font_scale, base_gray, lane_color, width):
+                          font, font_scale, base_gray, lane_color, width, cycle_len=9):
     seed_c = (lane * 9973 + time_step) & 0x7FFFFFFF
     rng_c = np.random.RandomState(seed_c)
     picks = rng_c.random(n_cols)
@@ -1136,8 +1141,10 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, offset, time_step, 
         x = int((col - offset) * char_h)
         if x < char_h or x > width:
             continue
-        color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
+        wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (col - offset) / cycle_len))
+        base_color = lane_color if (lane_color is not None and color_pick[col] < 0.6) else \
             (base_gray, base_gray, base_gray)
+        color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
         cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 1, cv2.LINE_AA)
 
 
@@ -1166,7 +1173,7 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
         silent = float(gate_env[gate_idx]) < SILENCE_THRESHOLD
 
     num_lanes = max(1, int(num_lanes))
-    glyphs = "01.:+*#%$"
+    glyphs = "01.:+*#%$?<>=/\\|^~;!ZXVNMTYJ"
     char_h = max(10, height // 28)
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.3, char_h / 28.0)
@@ -1285,12 +1292,12 @@ def _network_topology(seed, n_nodes):
     nel tempo, in risposta agli eventi."""
     n_nodes = max(3, int(n_nodes))
     rng = np.random.RandomState((int(seed) * 1013 + n_nodes * 7919) & 0x7FFFFFFF)
-    positions = rng.uniform(0.08, 0.92, size=(n_nodes, 2))
+    positions = rng.uniform(0.03, 0.97, size=(n_nodes, 2))  # quasi bordo a bordo, come un mesh che riempie tutta la scena
 
     diff = positions[:, None, :] - positions[None, :, :]
     dist = np.sqrt((diff ** 2).sum(axis=2))
     np.fill_diagonal(dist, np.inf)
-    k = 4
+    k = 5  # più collegamenti per nodo = mesh triangolato più fitto quando si accende
     order = np.argsort(dist, axis=1)
     edges = set()
     for i in range(n_nodes):
@@ -1358,10 +1365,12 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
         halo_c = tuple(int(c * fade * 0.5) for c in color)
         cv2.circle(frame, (px[origin], py[origin]), r_origin + 4, halo_c, 2, cv2.LINE_AA)
 
-        # propagazione dell'impulso per 2 salti lungo la rete, con decadimento
+        # propagazione dell'impulso per più salti lungo la rete, con decadimento —
+        # con molti eventi attivi insieme, la parte illuminata copre più scena
         visited = {origin: 0}
         frontier = [origin]
-        for hop in range(1, 3):
+        max_hops = 4
+        for hop in range(1, max_hops + 1):
             next_frontier = []
             for n in frontier:
                 for nb in neighbors.get(n, []):
@@ -1373,7 +1382,7 @@ def render_frame_rete(t, score, width=960, height=540, orientation="verticale",
         for node, hop in visited.items():
             if hop == 0:
                 continue
-            hop_fade = fade * (1.0 - hop / 3.0)
+            hop_fade = fade * (1.0 - hop / (max_hops + 1))
             if hop_fade <= 0:
                 continue
             c = tuple(int(c * hop_fade) for c in color)
