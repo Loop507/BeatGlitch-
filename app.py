@@ -1150,63 +1150,68 @@ def render_frame_automaton(t, score, width=960, height=540, orientation="vertica
     return frame
 
 
+def _datastream_glyph(col_seed_base, tape_index, n_glyphs):
+    """Un carattere del 'nastro' infinito della colonna: identità STABILE per
+    (colonna, indice) — non cambia finché non esce dallo schermo. È questo che fa
+    davvero scorrere il testo (come Matrix) invece di ri-randomizzare l'intera
+    colonna in blocco ad ogni ciclo."""
+    seed = (col_seed_base + tape_index * 131071) & 0x7FFFFFFF
+    rng = np.random.RandomState(seed)
+    idx = rng.randint(0, n_glyphs)
+    show = rng.random() < 0.95
+    color_roll = rng.random()
+    return idx, show, color_roll
+
+
 def _datastream_draw_column(frame, col, col_w, n_rows, char_h, t, scroll_speed_base, glyphs,
-                             font, font_scale, base_gray, lane_color, height, cycle_len=9):
+                             font, font_scale, base_gray, lane_color, height):
     # velocità e fase PROPRIE della colonna (stabili nel tempo, diverse da colonna
-    # a colonna): è questo che rompe l'effetto "blocco che si muove all'unisono" —
-    # ogni striscia di dati cade per conto suo, come nel riferimento reale
+    # a colonna): ogni striscia di dati cade per conto suo, come nel riferimento
     rng_speed = np.random.RandomState((col * 7793 + 12345) & 0x7FFFFFFF)
     speed_mult = 0.55 + rng_speed.random() * 0.9
     phase0 = rng_speed.random()
     own_speed = scroll_speed_base * speed_mult
-    offset = (t * own_speed + phase0) % 1.0
-    time_step = int(t * own_speed + phase0 * 1000)
 
-    seed_c = (col * 9973 + time_step) & 0x7FFFFFFF
-    rng_c = np.random.RandomState(seed_c)
-    picks = rng_c.random(n_rows)
-    char_idx = rng_c.randint(0, len(glyphs), n_rows)
-    color_pick = rng_c.random(n_rows)
+    scroll_units = t * own_speed + phase0 * 37.0
+    base_k = int(np.floor(scroll_units))
+    frac = scroll_units - base_k
 
-    # colore già sfumato in base alla distanza dalla corsia attiva più vicina —
-    # ogni colonna ha la SUA intensità, colonna per colonna, non a gruppi
     if lane_color is not None:
         color_full, strength = lane_color
         blended = tuple(base_gray + (cf - base_gray) * strength for cf in color_full)
     else:
         blended = None
 
+    col_seed_base = col * 9973
     x = int(col * col_w + col_w * 0.25)
-    for row in range(n_rows):
-        if picks[row] > 0.95:
+    for r in range(-1, n_rows + 1):
+        y = int((r + frac) * char_h)
+        if y < 0 or y > height:
             continue
-        y = int((row - offset) * char_h)
-        if y < char_h or y > height:
+        tape_index = r + base_k
+        idx, show, color_roll = _datastream_glyph(col_seed_base, tape_index, len(glyphs))
+        if not show:
             continue
-        # onda di luminosità che scorre con la stessa fase dello scroll: dà un
-        # capofila più acceso seguito da una scia che si affievolisce, invece di
-        # glifi tutti alla stessa intensità — è questo che fa "sentire" la caduta
-        wave = 0.45 + 0.55 * (0.5 + 0.5 * np.cos(2 * np.pi * (row - offset) / cycle_len))
-        base_color = blended if (blended is not None and color_pick[row] < 0.85) else \
+        # capofila (in fondo alla scia, il più recente) più acceso, il resto un
+        # filo più debole — non un'onda ripetuta, una vera scia con testa e coda
+        head_dist = (n_rows - r)
+        wave = max(0.55, 1.0 - head_dist * 0.02)
+        base_color = blended if (blended is not None and color_roll < 0.85) else \
             (base_gray, base_gray, base_gray)
-        color = tuple(min(255, max(0, int(ch * wave * 1.4))) for ch in base_color)
-        cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
+        color = tuple(min(255, max(0, int(ch * wave * 1.3))) for ch in base_color)
+        cv2.putText(frame, glyphs[idx], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
 def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, t, scroll_speed_base, glyphs,
-                          font, font_scale, base_gray, lane_color, width, cycle_len=9):
+                          font, font_scale, base_gray, lane_color, width):
     rng_speed = np.random.RandomState((lane * 7793 + 54321) & 0x7FFFFFFF)
     speed_mult = 0.55 + rng_speed.random() * 0.9
     phase0 = rng_speed.random()
     own_speed = scroll_speed_base * speed_mult
-    offset = (t * own_speed + phase0) % 1.0
-    time_step = int(t * own_speed + phase0 * 1000)
 
-    seed_c = (lane * 9973 + time_step) & 0x7FFFFFFF
-    rng_c = np.random.RandomState(seed_c)
-    picks = rng_c.random(n_cols)
-    char_idx = rng_c.randint(0, len(glyphs), n_cols)
-    color_pick = rng_c.random(n_cols)
+    scroll_units = t * own_speed + phase0 * 37.0
+    base_k = int(np.floor(scroll_units))
+    frac = scroll_units - base_k
 
     if lane_color is not None:
         color_full, strength = lane_color
@@ -1214,18 +1219,22 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, t, scroll_speed_bas
     else:
         blended = None
 
+    lane_seed_base = lane * 9973
     y = int(lane * row_h + row_h * 0.6)
-    for col in range(n_cols):
-        if picks[col] > 0.95:
+    for c in range(-1, n_cols + 1):
+        x = int((c + frac) * char_h)
+        if x < 0 or x > width:
             continue
-        x = int((col - offset) * char_h)
-        if x < char_h or x > width:
+        tape_index = c + base_k
+        idx, show, color_roll = _datastream_glyph(lane_seed_base, tape_index, len(glyphs))
+        if not show:
             continue
-        wave = 0.45 + 0.55 * (0.5 + 0.5 * np.cos(2 * np.pi * (col - offset) / cycle_len))
-        base_color = blended if (blended is not None and color_pick[col] < 0.85) else \
+        head_dist = (n_cols - c)
+        wave = max(0.55, 1.0 - head_dist * 0.02)
+        base_color = blended if (blended is not None and color_roll < 0.85) else \
             (base_gray, base_gray, base_gray)
-        color = tuple(min(255, max(0, int(ch * wave * 1.4))) for ch in base_color)
-        cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
+        color = tuple(min(255, max(0, int(ch * wave * 1.3))) for ch in base_color)
+        cv2.putText(frame, glyphs[idx], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
 def render_frame_datastream(t, score, width=960, height=540, orientation="verticale",
@@ -1258,7 +1267,7 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     char_w = max(6, int(char_h * 0.62))  # spaziatura fitta: colonne/righe dense, senza vuoti
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.3, char_h / 28.0)
-    base_gray = int(70 + macro_v * 30)
+    base_gray = int(42 + macro_v * 20)
 
     # scia persistente: non solo l'istante esatto dell'evento, ma anche un
     # breve strascico dopo — altrimenti con pochi colpi simultanei si vede un
