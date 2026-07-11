@@ -138,6 +138,18 @@ MODULES = {
         "quote_en": "No single hit lights everything up. Three bands breathe constantly, each on its own.",
         "hashtag": "#radialspectrum #audioreactive",
     },
+    "11": {
+        "nome": "Matrice 11 — Albero Ricorsivo",
+        "nome_en": "Matrix 11 — Recursive Tree",
+        "effetto": "Recursive Subdivision",
+        "processo": "Gerarchia di Rettangoli Annidati + Crescita/Potatura per Banda",
+        "processo_en": "Nested Rectangle Hierarchy + Band-Driven Growth/Pruning",
+        "motore_tag": "un albero che cresce e si pota da sé",
+        "motore_tag_en": "a tree that grows and prunes itself",
+        "quote": "La struttura non si sposta: cresce in profondità o si ritira, come un albero che respira.",
+        "quote_en": "The structure doesn't move: it grows deeper or retreats, like a breathing tree.",
+        "hashtag": "#recursivesubdivision #generativestructure",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -1621,6 +1633,112 @@ def render_frame_radiale(t, score, width=960, height=540, orientation="verticale
     return frame
 
 
+@lru_cache(maxsize=64)
+def _mondrian_tree(seed, max_depth):
+    """Albero binario FISSO (calcolato una volta dal seed) di rettangoli annidati
+    — coordinate normalizzate 0..1. A differenza di Henke (mosaico a celle fisse)
+    o Molnár (griglia che devia raramente), qui la STRUTTURA STESSA è una
+    gerarchia che si ramifica; non cambia posizione nel tempo, ma quanta
+    profondità dell'albero si vede sì (agganciato all'energia delle bande)."""
+    rng = np.random.RandomState(seed & 0x7FFFFFFF)
+    nodes = []
+
+    def recurse(x0, y0, x1, y1, depth, axis):
+        nodes.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "depth": depth, "axis": axis})
+        if depth >= max_depth:
+            return
+        ratio = 0.35 + 0.3 * rng.random()
+        next_axis = "h" if axis == "v" else "v"
+        if axis == "v":
+            xm = x0 + (x1 - x0) * ratio
+            recurse(x0, y0, xm, y1, depth + 1, next_axis)
+            recurse(xm, y0, x1, y1, depth + 1, next_axis)
+        else:
+            ym = y0 + (y1 - y0) * ratio
+            recurse(x0, y0, x1, ym, depth + 1, next_axis)
+            recurse(x0, ym, x1, y1, depth + 1, next_axis)
+
+    recurse(0.0, 0.0, 1.0, 1.0, 0, "v")
+    return nodes
+
+
+def render_frame_ricorsiva(t, score, width=960, height=540, orientation="verticale",
+                           num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                           position_mode="pan"):
+    """Matrice 11: non celle fisse né una griglia che devia — un ALBERO DI
+    RETTANGOLI che si ramifica ricorsivamente. La struttura è fissa (calcolata
+    dal seed), ma quanto in profondità si vede l'albero è pilotato IN CONTINUO
+    dai bassi (crescita), mentre gli acuti 'potano' pseudo-casualmente rami
+    profondi nel tempo. Gli eventi non disegnano oggetti propri: illuminano
+    brevemente la cella foglia più vicina alla loro posizione."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+
+    max_depth = int(np.clip(2 + np.log2(max(2, num_lanes)), 3, 9))
+    nodes = _mondrian_tree(int(score["seed"]), max_depth)
+
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+    bass = _band_continuous_value(mosaic["bass"], mode, block_seconds, t)
+    mid = _band_continuous_value(mosaic["mid"], mode, block_seconds, t)
+    treble = _band_continuous_value(mosaic["treble"], mode, block_seconds, t)
+
+    depth_threshold = 1.2 + bass * (max_depth - 1.2)  # i bassi fanno "crescere" l'albero
+    bc = band_colors or DEFAULT_BAND_COLORS
+    band_names = ["bass", "mid", "treble"]
+
+    for node in nodes:
+        d = node["depth"]
+        if d > depth_threshold:
+            continue
+        if d > 2:
+            # gli acuti "potano" pseudo-casualmente rami profondi, in modo che
+            # cambi nel tempo (non una griglia statica): più acuti, meno potatura
+            prune_seed = (hash((round(node["x0"], 4), round(node["y0"], 4), d, int(t * 4))) % 1000) / 1000.0
+            if prune_seed > (0.35 + 0.55 * treble):
+                continue
+
+        x0, y0 = int(node["x0"] * width), int(node["y0"] * height)
+        x1, y1 = int(node["x1"] * width), int(node["y1"] * height)
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        band_name = band_names[d % 3]
+        base_color = bc.get(band_name, (170, 170, 180))
+        shade = 0.25 + 0.55 * (d / max_depth) + 0.2 * mid
+        color = tuple(int(c * shade) for c in base_color)
+        thickness = max(1, int(1 + 2 * mid))
+        cv2.rectangle(frame, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), color, thickness, cv2.LINE_AA)
+
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / duration) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame
+
+    leaves = [n for n in nodes if n["depth"] == max_depth] or nodes
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    for e in active:
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        fade = 1.0 - prog
+        color = get_event_color(e, palette, band_colors)
+
+        if orientation == "orizzontale":
+            target_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+            best = min(leaves, key=lambda n: abs((n["y0"] + n["y1"]) / 2 - target_frac))
+        else:
+            target_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+            best = min(leaves, key=lambda n: abs((n["x0"] + n["x1"]) / 2 - target_frac))
+
+        x0, y0 = int(best["x0"] * width), int(best["y0"] * height)
+        x1, y1 = int(best["x1"] * width), int(best["y1"] * height)
+        c = tuple(int(ch * fade * (0.5 + 0.5 * e["vel"])) for ch in color)
+        cv2.rectangle(frame, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), c, -1)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -2155,6 +2273,62 @@ def synthesize_audio_radiale(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_ricorsiva(score, sr=SR):
+    """Matrice 11: tre oscillatori a onda TRIANGOLARE (non seno, non quadra —
+    un timbro più 'architettonico', preciso) modulati in continuo dalle tre
+    bande, come l'albero visivo: cresce e si pota da solo. Gli eventi reali si
+    sovrappongono come brevi impulsi per la sincronia con la cella che si
+    illumina nel fotogramma."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    t_ax = np.arange(N) / sr
+
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+    step = 0.05
+    n_steps = int(duration / step) + 2
+    times_steps = np.arange(n_steps) * step
+    bass_vals = np.array([_band_continuous_value(mosaic["bass"], mode, block_seconds, tt) for tt in times_steps])
+    mid_vals = np.array([_band_continuous_value(mosaic["mid"], mode, block_seconds, tt) for tt in times_steps])
+    treble_vals = np.array([_band_continuous_value(mosaic["treble"], mode, block_seconds, tt) for tt in times_steps])
+    bass_env = np.interp(t_ax, times_steps, bass_vals)
+    mid_env = np.interp(t_ax, times_steps, mid_vals)
+    treble_env = np.interp(t_ax, times_steps, treble_vals)
+
+    def _triangle(freq, t_axis):
+        x = freq * t_axis
+        return 2.0 * np.abs(2.0 * (x - np.floor(x + 0.5))) - 1.0
+
+    osc_bass = _triangle(55.0, t_ax) * (0.10 + 0.20 * bass_env)
+    osc_mid = _triangle(220.0, t_ax) * (0.06 + 0.14 * mid_env)
+    osc_treble = _triangle(660.0, t_ax) * (0.04 + 0.10 * treble_env)
+    drone = osc_bass + osc_mid + osc_treble
+    out_l = drone.copy()
+    out_r = drone.copy()
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.05 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 220.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        tone = _triangle(freq, seg_t)
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = tone * env_local * e["vel"] * 0.3
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -2211,6 +2385,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Fixed Network Topology / Impulse Propagation")
     if module_id == "10":
         analisi.append("Continuous Band Envelope Following / Concentric Ring Modulation")
+    if module_id == "11":
+        analisi.append("Recursive Tree Subdivision / Band-Driven Depth Growth")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -2349,11 +2525,11 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
               "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
               "07": render_frame_datastream, "08": render_frame_oscilloscopio, "09": render_frame_rete,
-              "10": render_frame_radiale}
+              "10": render_frame_radiale, "11": render_frame_ricorsiva}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
              "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
              "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio, "09": synthesize_audio_rete,
-             "10": synthesize_audio_radiale}
+             "10": synthesize_audio_radiale, "11": synthesize_audio_ricorsiva}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -2391,6 +2567,12 @@ elif module_id == "10":
     st.caption("Modulo 10: tre anelli concentrici (bassi/medi/alti) pulsano sempre, "
                "in continuo, con l'energia reale delle tre bande — non solo ai colpi. "
                "Gli eventi aggiungono solo brevi spuntoni luminosi sopra l'anello.")
+elif module_id == "11":
+    st.caption("Modulo 11: un albero di rettangoli che si ramifica. I bassi lo fanno "
+               "crescere in profondità, gli acuti potano rami pseudo-casualmente nel "
+               "tempo. Gli eventi illuminano solo la cella foglia più vicina.")
+
+
 
 
 
@@ -2749,7 +2931,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "10":
         # Modulo 10: tre anelli concentrici sempre pulsanti con l'energia reale di
         # bassi/medi/alti. 'Numero di linee' qui è la risoluzione angolare degli
         # anelli (quanti segmenti li compongono).
@@ -2781,6 +2963,41 @@ with st.sidebar:
         else:
             palette_options_10 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_10, key="palette_10")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 11: la struttura (albero di rettangoli) è fissa dal seed —
+        # 'Numero di linee' qui regola la profondità massima dell'albero
+        # (quante volte può dividersi ricorsivamente).
+        st.caption("L'albero è fisso nella forma: i bassi lo fanno crescere in "
+                   "profondità, gli acuti potano rami nel tempo. 'Numero di linee' "
+                   "qui regola quanto in profondità può arrivare l'albero.")
+        orientamento_label_11 = st.radio("Asse guizzi evento", ["Verticale", "Orizzontale"],
+                                          horizontal=True, key="orientamento_11")
+        orientamento = "verticale" if orientamento_label_11 == "Verticale" else "orizzontale"
+        num_lanes = st.slider("Profondità massima albero", 2, 20, 8, key="num_lanes_11")
+        posizione_label_11 = st.radio("Posizione guizzi", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_11")
+        position_mode = "pan" if posizione_label_11 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_11 = st.checkbox("Colori separati per bassi/medi/alti", value=True, key="banda_toggle_11")
+        band_colors = None
+        if usa_banda_11:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_11 = st.color_picker("Bassi", "#EB2828", key="ric_bassi")
+            c_medi_11 = st.color_picker("Medi", "#FFAA00", key="ric_medi")
+            c_alti_11 = st.color_picker("Alti", "#00C8FF", key="ric_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_11), "mid": _hex_to_rgb(c_medi_11),
+                            "treble": _hex_to_rgb(c_alti_11)}
+        else:
+            palette_options_11 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_11, key="palette_11")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
@@ -2916,6 +3133,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         elif module_id == "09":
             extra_kwargs = {"position_mode": position_mode}
         elif module_id == "10":
+            extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "11":
             extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
