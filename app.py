@@ -1168,6 +1168,14 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, t, scroll_speed_b
     char_idx = rng_c.randint(0, len(glyphs), n_rows)
     color_pick = rng_c.random(n_rows)
 
+    # colore già sfumato in base alla distanza dalla corsia attiva più vicina —
+    # ogni colonna ha la SUA intensità, colonna per colonna, non a gruppi
+    if lane_color is not None:
+        color_full, strength = lane_color
+        blended = tuple(base_gray + (cf - base_gray) * strength for cf in color_full)
+    else:
+        blended = None
+
     x = int(col * col_w + col_w * 0.25)
     for row in range(n_rows):
         if picks[row] > 0.95:
@@ -1179,9 +1187,9 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, t, scroll_speed_b
         # capofila più acceso seguito da una scia che si affievolisce, invece di
         # glifi tutti alla stessa intensità — è questo che fa "sentire" la caduta
         wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (row - offset) / cycle_len))
-        base_color = lane_color if (lane_color is not None and color_pick[row] < 0.85) else \
+        base_color = blended if (blended is not None and color_pick[row] < 0.85) else \
             (base_gray, base_gray, base_gray)
-        color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
+        color = tuple(min(255, max(0, int(ch * wave * 1.4))) for ch in base_color)
         cv2.putText(frame, glyphs[char_idx[row]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
@@ -1200,6 +1208,12 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, t, scroll_speed_bas
     char_idx = rng_c.randint(0, len(glyphs), n_cols)
     color_pick = rng_c.random(n_cols)
 
+    if lane_color is not None:
+        color_full, strength = lane_color
+        blended = tuple(base_gray + (cf - base_gray) * strength for cf in color_full)
+    else:
+        blended = None
+
     y = int(lane * row_h + row_h * 0.6)
     for col in range(n_cols):
         if picks[col] > 0.95:
@@ -1208,9 +1222,9 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, t, scroll_speed_bas
         if x < char_h or x > width:
             continue
         wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (col - offset) / cycle_len))
-        base_color = lane_color if (lane_color is not None and color_pick[col] < 0.85) else \
+        base_color = blended if (blended is not None and color_pick[col] < 0.85) else \
             (base_gray, base_gray, base_gray)
-        color = tuple(min(255, int(ch * wave * 1.4)) for ch in base_color)
+        color = tuple(min(255, max(0, int(ch * wave * 1.4))) for ch in base_color)
         cv2.putText(frame, glyphs[char_idx[col]], (x, y), font, font_scale, color, 2, cv2.LINE_AA)
 
 
@@ -1246,23 +1260,40 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     font_scale = max(0.3, char_h / 28.0)
     base_gray = int(28 + macro_v * 18)
 
-    active_by_lane = {}
+    active_events_list = []
     if not silent:
         for e in score["events"]:
             if e["t"] <= t <= e["t"] + max(e["dur"], 0.05):
                 lane_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
-                lane_idx = int(lane_frac * num_lanes)
-                active_by_lane.setdefault(lane_idx, []).append(e)
+                active_events_list.append((e, lane_frac))
 
-    spread = max(1, num_lanes // 6)  # quante corsie vicine "prendono" il colore di una corsia attiva
+    spread_cols = 0.7  # molto stretta: solo 2-3 colonne isolate per evento, non una zona sfumata
 
-    def _lane_color(lane_idx):
-        for d in range(0, spread + 1):
-            for cand in ({lane_idx - d, lane_idx + d} if d else {lane_idx}):
-                active_events = active_by_lane.get(cand)
-                if active_events:
-                    return get_event_color(max(active_events, key=lambda e: e["vel"]), palette, band_colors)
-        return None
+    def _make_lane_color_fn(n_positions):
+        """Restituisce una funzione pos -> (colore, intensità) sfumati per distanza
+        IN COLONNE dalla posizione dell'evento attivo più vicino — non più per
+        distanza di 'corsia' (che raggruppava molte colonne insieme). Ogni singola
+        colonna/riga densa reagisce per conto proprio, e solo 2-3 colonne isolate
+        per evento restano colorate: non una zona sfumata larga, colonne separate."""
+        if not active_events_list:
+            return lambda pos: None
+        event_positions = [(get_event_color(e, palette, band_colors), frac * n_positions)
+                            for e, frac in active_events_list]
+
+        def _fn(pos):
+            accum = np.zeros(3, dtype=float)
+            total_w = 0.0
+            for color, epos in event_positions:
+                dist = abs(pos - epos)
+                w = np.exp(-dist / spread_cols)
+                if w < 0.15:
+                    continue
+                accum += np.array(color, dtype=float) * w
+                total_w += w
+            if total_w <= 0:
+                return None
+            return tuple(accum / total_w), min(1.0, total_w)
+        return _fn
 
     # velocità di scorrimento agganciata al battito reale: 2 celle per battito come
     # base, invece di una costante arbitraria — un brano veloce fa scorrere il
@@ -1279,30 +1310,32 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     row_span = max(1, n_rows_dense // num_lanes)
 
     if orientation == "verticale":
+        color_fn = _make_lane_color_fn(n_cols_dense)
         for col in range(n_cols_dense):
-            lane_idx = min(num_lanes - 1, col // col_span)
-            lane_color = _lane_color(lane_idx)
+            lane_color = color_fn(col)
             _datastream_draw_column(frame, col, char_w, n_rows, char_h, t, scroll_speed, glyphs,
                                      font, font_scale, base_gray, lane_color, height)
     elif orientation == "orizzontale":
+        color_fn = _make_lane_color_fn(n_rows_dense)
         for row in range(n_rows_dense):
-            lane_idx = min(num_lanes - 1, row // row_span)
-            lane_color = _lane_color(lane_idx)
+            lane_color = color_fn(row)
             _datastream_draw_row(frame, row, char_w, n_cols, char_h, t, scroll_speed, glyphs,
                                   font, font_scale, base_gray, lane_color, width)
     else:  # misto: strisce verticali e orizzontali convivono nello stesso fotogramma
+        color_fn_v = _make_lane_color_fn(n_cols_dense)
+        color_fn_h = _make_lane_color_fn(n_rows_dense)
         for col in range(n_cols_dense):
             lane_idx = min(num_lanes - 1, col // col_span)
             if lane_idx % 2 != 0:
                 continue
-            lane_color = _lane_color(lane_idx)
+            lane_color = color_fn_v(col)
             _datastream_draw_column(frame, col, char_w, n_rows, char_h, t, scroll_speed, glyphs,
                                      font, font_scale, base_gray, lane_color, height)
         for row in range(n_rows_dense):
             lane_idx = min(num_lanes - 1, row // row_span)
             if lane_idx % 2 == 0:
                 continue
-            lane_color = _lane_color(lane_idx)
+            lane_color = color_fn_h(row)
             _datastream_draw_row(frame, row, char_w, n_cols, char_h, t, scroll_speed, glyphs,
                                   font, font_scale, base_gray, lane_color, width)
 
