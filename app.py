@@ -1290,27 +1290,24 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
             lane_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
             active_events_list.append((e, lane_frac, recency))
 
-    spread_cols = 1.4  # colonne isolate ma non puntiformi: 3-5 colonne per guizzo
-
     def _make_lane_color_fn(n_positions):
-        """Restituisce una funzione pos -> (colore, intensità) sfumati per distanza
-        IN COLONNE dalla posizione dell'evento attivo/recente più vicino — non più
-        per distanza di 'corsia' (che raggruppava molte colonne insieme). Ogni
-        singola colonna/riga densa reagisce per conto proprio; la scia (recency)
-        fa sì che più eventi restino visibili insieme invece che un guizzo isolato
-        alla volta."""
+        """Restituisce una funzione pos -> (colore, intensità) per la colonna/riga
+        ESATTA più vicina a ciascun evento attivo/recente — un filo isolato, non
+        un gruppetto: le colonne vicine restano pure grigie, nessuna sfumatura
+        spaziale. La scia (recency) resta, così il filo non sparisce di scatto."""
         if not active_events_list:
             return lambda pos: None
-        event_positions = [(get_event_color(e, palette, band_colors), frac * n_positions, recency)
+        event_positions = [(get_event_color(e, palette, band_colors), round(frac * n_positions), recency)
                             for e, frac, recency in active_events_list]
 
         def _fn(pos):
             accum = np.zeros(3, dtype=float)
             total_w = 0.0
             for color, epos, recency in event_positions:
-                dist = abs(pos - epos)
-                w = np.exp(-dist / spread_cols) * recency
-                if w < 0.12:
+                if epos != pos:
+                    continue
+                w = recency
+                if w < 0.08:
                     continue
                 accum += np.array(color, dtype=float) * w
                 total_w += w
