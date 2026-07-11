@@ -150,6 +150,18 @@ MODULES = {
         "quote_en": "The structure doesn't move: it grows deeper or retreats, like a breathing tree.",
         "hashtag": "#recursivesubdivision #generativestructure",
     },
+    "12": {
+        "nome": "Matrice 12 — Sciame",
+        "nome_en": "Matrix 12 — Swarm",
+        "effetto": "Particle Swarm",
+        "processo": "Orbite Indipendenti per Particella + Eccitazione da Evento",
+        "processo_en": "Independent Per-Particle Orbits + Event Excitation",
+        "motore_tag": "tante orbite, un solo respiro collettivo",
+        "motore_tag_en": "many orbits, one collective breath",
+        "quote": "Nessun punto guida gli altri. Respirano tutti insieme, ognuno per conto suo.",
+        "quote_en": "No point leads the others. They all breathe together, each on its own.",
+        "hashtag": "#particleswarm #generativemotion",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -1739,6 +1751,87 @@ def render_frame_ricorsiva(t, score, width=960, height=540, orientation="vertica
     return frame
 
 
+@lru_cache(maxsize=64)
+def _swarm_params(seed, n_particles):
+    """Parametri FISSI per ogni particella (orbita propria, calcolata dal seed):
+    posizione base distribuita bordo a bordo su tutto il fotogramma, non solo al
+    centro — è questo che fa 'riempire tutta la scena' invece di un piccolo
+    ammasso in mezzo."""
+    rng = np.random.RandomState(seed & 0x7FFFFFFF)
+    base_x = rng.uniform(0.03, 0.97, n_particles)
+    base_y = rng.uniform(0.03, 0.97, n_particles)
+    freq_x = rng.uniform(0.04, 0.22, n_particles)
+    freq_y = rng.uniform(0.04, 0.22, n_particles)
+    phase = rng.uniform(0, 2 * np.pi, n_particles)
+    phase_y = rng.uniform(0, 2 * np.pi, n_particles)
+    radius = rng.uniform(0.02, 0.09, n_particles)
+    return base_x, base_y, freq_x, freq_y, phase, phase_y, radius
+
+
+def render_frame_sciame(t, score, width=960, height=540, orientation="verticale",
+                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None,
+                        position_mode="pan"):
+    """Matrice 12: uno SCIAME DI PARTICELLE indipendenti — non un'unica curva
+    (come l'Oscilloscopio), non un tessuto continuo (come l'Automa): tanti punti
+    separati, ognuno con la propria orbita ellittica fissa (calcolata dal seed),
+    distribuiti su TUTTO il fotogramma (bordo a bordo). I bassi allargano le
+    orbite, gli acuti aggiungono un tremolio rapido, i medi accelerano la deriva
+    collettiva. Gli eventi eccitano solo la particella più vicina alla loro
+    posizione (pan/frequenza) — un breve bagliore, non un oggetto nuovo."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    duration = max(score["duration"], 1e-6)
+
+    n_particles = max(40, int(num_lanes) * 15)  # densità: riempie l'intera scena
+    base_x, base_y, freq_x, freq_y, phase, phase_y, radius = _swarm_params(int(score["seed"]), n_particles)
+
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+    bass = _band_continuous_value(mosaic["bass"], mode, block_seconds, t)
+    mid = _band_continuous_value(mosaic["mid"], mode, block_seconds, t)
+    treble = _band_continuous_value(mosaic["treble"], mode, block_seconds, t)
+
+    radius_mod = radius * (0.5 + 1.4 * bass)
+    drift_speed = 1.0 + 1.2 * mid
+    jitter = 0.012 * treble * np.sin(t * 41.0 + phase * 17.0)
+
+    x = base_x + radius_mod * np.cos(freq_x * 2 * np.pi * t * drift_speed + phase) + jitter
+    y = base_y + radius_mod * np.sin(freq_y * 2 * np.pi * t * drift_speed + phase_y)
+    px = np.clip(x, 0.0, 0.999) * width
+    py = np.clip(y, 0.0, 0.999) * height
+
+    base_gray = int(30 + bass * 20)
+    for i in range(n_particles):
+        cv2.circle(frame, (int(px[i]), int(py[i])), 1, (base_gray, base_gray, base_gray), -1, cv2.LINE_AA)
+
+    SILENCE_THRESHOLD = 0.06
+    gate_env = score.get("silence_envelope")
+    if gate_env is not None:
+        gate_idx = min(len(gate_env) - 1, int((t / duration) * len(gate_env)))
+        if float(gate_env[gate_idx]) < SILENCE_THRESHOLD:
+            return frame
+
+    active = [e for e in score["events"] if e["t"] <= t <= e["t"] + max(e["dur"], 0.05)]
+    for e in active:
+        prog = (t - e["t"]) / max(e["dur"], 0.05)
+        fade = 1.0 - prog
+        color = get_event_color(e, palette, band_colors)
+
+        target_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+        if orientation == "orizzontale":
+            dist = np.abs(y - target_frac)
+        else:
+            dist = np.abs(x - target_frac)
+        idx = int(np.argmin(dist))
+
+        cx_p, cy_p = int(px[idx]), int(py[idx])
+        r = max(2, int(3 + 10 * e["vel"] * fade))
+        c = tuple(int(ch * fade) for ch in color)
+        cv2.circle(frame, (cx_p, cy_p), r, c, -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx_p, cy_p), r + 4, tuple(int(ch * fade * 0.5) for ch in color), 1, cv2.LINE_AA)
+
+    return frame
+
+
 # ============================================================
 # 5. GENERATORE AUDIO
 # ============================================================
@@ -2329,6 +2422,60 @@ def synthesize_audio_ricorsiva(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_sciame(score, sr=SR):
+    """Matrice 12: sintesi FM ('shimmer', a campanello) — timbro distinto da tutti
+    gli altri moduli — modulata in continuo dalle tre bande, come le orbite dello
+    sciame visivo. Gli eventi si sovrappongono come brevi impulsi FM più marcati,
+    per la sincronia con la particella eccitata nel fotogramma."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    t_ax = np.arange(N) / sr
+
+    mosaic = score["band_mosaic"]
+    mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
+    step = 0.05
+    n_steps = int(duration / step) + 2
+    times_steps = np.arange(n_steps) * step
+    bass_vals = np.array([_band_continuous_value(mosaic["bass"], mode, block_seconds, tt) for tt in times_steps])
+    mid_vals = np.array([_band_continuous_value(mosaic["mid"], mode, block_seconds, tt) for tt in times_steps])
+    treble_vals = np.array([_band_continuous_value(mosaic["treble"], mode, block_seconds, tt) for tt in times_steps])
+    bass_env = np.interp(t_ax, times_steps, bass_vals)
+    mid_env = np.interp(t_ax, times_steps, mid_vals)
+    treble_env = np.interp(t_ax, times_steps, treble_vals)
+
+    carrier = 220.0
+    modulator = 3.0 + 5.0 * mid_env
+    mod_index = 1.5 + 4.0 * bass_env
+    phase_mod = 2 * np.pi * np.cumsum(modulator) / sr
+    phase_car = 2 * np.pi * carrier * t_ax + mod_index * np.sin(phase_mod)
+    drone = np.sin(phase_car) * (0.05 + 0.10 * treble_env) * (0.3 + 0.7 * bass_env)
+    out_l = drone.copy()
+    out_r = drone * 0.95
+
+    for e in score["events"]:
+        start = int(e["t"] * sr)
+        dur_n = max(int(0.08 * sr), int(e["dur"] * sr))
+        end = min(N, start + dur_n)
+        if start >= N or end <= start:
+            continue
+        seg_len = end - start
+        freq = 220.0 * (2 ** ((e["pitch"] - 69) / 12))
+        seg_t = np.arange(seg_len) / sr
+        mod_i = 2.0 + 3.0 * e["vel"]
+        tone = np.sin(2 * np.pi * freq * seg_t + mod_i * np.sin(2 * np.pi * (freq * 1.5) * seg_t))
+        env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
+        signal = tone * env_local * e["vel"] * 0.32
+
+        pan = e.get("pan", 0.0) or 0.0
+        gain_l = float(np.sqrt((1.0 - pan) / 2.0))
+        gain_r = float(np.sqrt((1.0 + pan) / 2.0))
+        out_l[start:end] += signal * gain_l
+        out_r[start:end] += signal * gain_r
+
+    stereo = np.stack([np.clip(out_l, -1.0, 1.0), np.clip(out_r, -1.0, 1.0)])
+    return stereo
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -2387,6 +2534,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Continuous Band Envelope Following / Concentric Ring Modulation")
     if module_id == "11":
         analisi.append("Recursive Tree Subdivision / Band-Driven Depth Growth")
+    if module_id == "12":
+        analisi.append("Independent Particle Orbits / FM Shimmer Synthesis")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -2525,11 +2674,11 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
               "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
               "07": render_frame_datastream, "08": render_frame_oscilloscopio, "09": render_frame_rete,
-              "10": render_frame_radiale, "11": render_frame_ricorsiva}
+              "10": render_frame_radiale, "11": render_frame_ricorsiva, "12": render_frame_sciame}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
              "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
              "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio, "09": synthesize_audio_rete,
-             "10": synthesize_audio_radiale, "11": synthesize_audio_ricorsiva}
+             "10": synthesize_audio_radiale, "11": synthesize_audio_ricorsiva, "12": synthesize_audio_sciame}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -2571,6 +2720,12 @@ elif module_id == "11":
     st.caption("Modulo 11: un albero di rettangoli che si ramifica. I bassi lo fanno "
                "crescere in profondità, gli acuti potano rami pseudo-casualmente nel "
                "tempo. Gli eventi illuminano solo la cella foglia più vicina.")
+elif module_id == "12":
+    st.caption("Modulo 12: uno sciame di particelle indipendenti riempie tutto il "
+               "fotogramma. I bassi allargano le orbite, gli acuti aggiungono un "
+               "tremolio; gli eventi eccitano solo la particella più vicina.")
+
+
 
 
 
@@ -2966,7 +3121,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "11":
         # Modulo 11: la struttura (albero di rettangoli) è fissa dal seed —
         # 'Numero di linee' qui regola la profondità massima dell'albero
         # (quante volte può dividersi ricorsivamente).
@@ -2998,6 +3153,41 @@ with st.sidebar:
         else:
             palette_options_11 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
             palette = st.selectbox("Palette colore", palette_options_11, key="palette_11")
+
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 12: le particelle hanno orbite fisse (dal seed), distribuite su
+        # tutto il fotogramma. 'Numero di linee' qui regola la densità dello
+        # sciame (particelle totali = valore x15).
+        st.caption("Lo sciame riempie sempre tutta la scena, bordo a bordo. "
+                   "'Numero di linee' qui regola quante particelle compongono "
+                   "lo sciame (più alto = più denso).")
+        orientamento_label_12 = st.radio("Asse guizzi evento", ["Verticale", "Orizzontale"],
+                                          horizontal=True, key="orientamento_12")
+        orientamento = "verticale" if orientamento_label_12 == "Verticale" else "orizzontale"
+        num_lanes = st.slider("Densità sciame", 5, 40, 15, key="num_lanes_12")
+        posizione_label_12 = st.radio("Posizione guizzi", ["Pan stereo reale", "Frequenza (bassi←→alti)"],
+                                       horizontal=True, key="posizione_12")
+        position_mode = "pan" if posizione_label_12 == "Pan stereo reale" else "frequenza"
+
+        usa_banda_12 = st.checkbox("Colori separati per bassi/medi/alti", value=False, key="banda_toggle_12")
+        band_colors = None
+        if usa_banda_12:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_12 = st.color_picker("Bassi", "#EB2828", key="sci_bassi")
+            c_medi_12 = st.color_picker("Medi", "#FFAA00", key="sci_medi")
+            c_alti_12 = st.color_picker("Alti", "#00C8FF", key="sci_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_12), "mid": _hex_to_rgb(c_medi_12),
+                            "treble": _hex_to_rgb(c_alti_12)}
+        else:
+            palette_options_12 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_12, key="palette_12")
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
@@ -3135,6 +3325,8 @@ if st.button("🚀 GENERA", use_container_width=True):
         elif module_id == "10":
             extra_kwargs = {"position_mode": position_mode}
         elif module_id == "11":
+            extra_kwargs = {"position_mode": position_mode}
+        elif module_id == "12":
             extra_kwargs = {"position_mode": position_mode}
 
         def make_frame(t):
