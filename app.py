@@ -979,7 +979,12 @@ def apply_visual_degradation(frame, t, seed, usura_level, memory_frame=None):
             out[y0:y1] = memory_frame[y0:y1]
 
     noise_amp = 6 + 18 * usura_level  # grana visibile fin da subito, non solo ad usura alta
-    noise = rng.normal(0, noise_amp, out.shape)
+    # generato a risoluzione ridotta e scalato: texture di grana equivalente,
+    # ma senza il costo di generare un rumore gaussiano indipendente per ogni
+    # singolo pixel/canale a piena risoluzione (era il vero collo di bottiglia)
+    small_h, small_w = max(1, h // 4), max(1, w // 4)
+    noise_small = rng.normal(0, noise_amp, (small_h, small_w, 3)).astype(np.float32)
+    noise = cv2.resize(noise_small, (w, h), interpolation=cv2.INTER_LINEAR)
     out = np.clip(out.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
     return out
@@ -1555,7 +1560,6 @@ def render_frame_radiale(t, score, width=960, height=540, orientation="verticale
     loro posizione (pan/frequenza) — mai un oggetto proprio, solo un guizzo
     sopra ciò che già pulsa da sé."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
-    duration = max(score["duration"], 1e-6)
     cx, cy = width / 2.0, height / 2.0
     base_r = min(width, height) * 0.5
 
@@ -1874,7 +1878,6 @@ def synthesize_audio_stocastico(score, sr=SR):
         semitone_shift = rng_e.uniform(-12, 12) * (0.3 + 0.7 * e["vel"])
         freq_end = freq_start * (2 ** (semitone_shift / 12))
 
-        seg_t = np.arange(seg_len) / sr
         inst_freq = np.linspace(freq_start, freq_end, seg_len)
         phase = 2 * np.pi * np.cumsum(inst_freq) / sr
         env_local = np.hanning(seg_len) if seg_len > 1 else np.ones(seg_len)
@@ -2321,7 +2324,6 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
 
 
 
-import base64
 from datetime import datetime
 import streamlit as st
 try:
