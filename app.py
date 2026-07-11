@@ -1186,7 +1186,7 @@ def _datastream_draw_column(frame, col, col_w, n_rows, char_h, t, scroll_speed_b
         # onda di luminosità che scorre con la stessa fase dello scroll: dà un
         # capofila più acceso seguito da una scia che si affievolisce, invece di
         # glifi tutti alla stessa intensità — è questo che fa "sentire" la caduta
-        wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (row - offset) / cycle_len))
+        wave = 0.45 + 0.55 * (0.5 + 0.5 * np.cos(2 * np.pi * (row - offset) / cycle_len))
         base_color = blended if (blended is not None and color_pick[row] < 0.85) else \
             (base_gray, base_gray, base_gray)
         color = tuple(min(255, max(0, int(ch * wave * 1.4))) for ch in base_color)
@@ -1221,7 +1221,7 @@ def _datastream_draw_row(frame, lane, row_h, n_cols, char_h, t, scroll_speed_bas
         x = int((col - offset) * char_h)
         if x < char_h or x > width:
             continue
-        wave = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * (col - offset) / cycle_len))
+        wave = 0.45 + 0.55 * (0.5 + 0.5 * np.cos(2 * np.pi * (col - offset) / cycle_len))
         base_color = blended if (blended is not None and color_pick[col] < 0.85) else \
             (base_gray, base_gray, base_gray)
         color = tuple(min(255, max(0, int(ch * wave * 1.4))) for ch in base_color)
@@ -1258,7 +1258,7 @@ def render_frame_datastream(t, score, width=960, height=540, orientation="vertic
     char_w = max(6, int(char_h * 0.62))  # spaziatura fitta: colonne/righe dense, senza vuoti
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.3, char_h / 28.0)
-    base_gray = int(28 + macro_v * 18)
+    base_gray = int(70 + macro_v * 30)
 
     # scia persistente: non solo l'istante esatto dell'evento, ma anche un
     # breve strascico dopo — altrimenti con pochi colpi simultanei si vede un
