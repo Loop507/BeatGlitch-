@@ -1760,12 +1760,15 @@ def _swarm_params(seed, n_particles):
     rng = np.random.RandomState(seed & 0x7FFFFFFF)
     base_x = rng.uniform(0.03, 0.97, n_particles)
     base_y = rng.uniform(0.03, 0.97, n_particles)
-    freq_x = rng.uniform(0.04, 0.22, n_particles)
-    freq_y = rng.uniform(0.04, 0.22, n_particles)
+    freq_x = rng.uniform(0.03, 0.16, n_particles)
+    freq_y = rng.uniform(0.03, 0.16, n_particles)
     phase = rng.uniform(0, 2 * np.pi, n_particles)
     phase_y = rng.uniform(0, 2 * np.pi, n_particles)
-    radius = rng.uniform(0.02, 0.09, n_particles)
-    return base_x, base_y, freq_x, freq_y, phase, phase_y, radius
+    radius = rng.uniform(0.10, 0.34, n_particles)  # orbite ampie: movimento vero, non tremolio sul posto
+    size = rng.uniform(1.6, 3.4, n_particles)  # dimensione propria, non tutte uguali
+    twinkle_phase = rng.uniform(0, 2 * np.pi, n_particles)
+    twinkle_speed = rng.uniform(0.5, 2.2, n_particles)
+    return base_x, base_y, freq_x, freq_y, phase, phase_y, radius, size, twinkle_phase, twinkle_speed
 
 
 def render_frame_sciame(t, score, width=960, height=540, orientation="verticale",
@@ -1773,16 +1776,17 @@ def render_frame_sciame(t, score, width=960, height=540, orientation="verticale"
                         position_mode="pan"):
     """Matrice 12: uno SCIAME DI PARTICELLE indipendenti — non un'unica curva
     (come l'Oscilloscopio), non un tessuto continuo (come l'Automa): tanti punti
-    separati, ognuno con la propria orbita ellittica fissa (calcolata dal seed),
-    distribuiti su TUTTO il fotogramma (bordo a bordo). I bassi allargano le
-    orbite, gli acuti aggiungono un tremolio rapido, i medi accelerano la deriva
-    collettiva. Gli eventi eccitano solo la particella più vicina alla loro
-    posizione (pan/frequenza) — un breve bagliore, non un oggetto nuovo."""
+    separati, ognuno con orbita ampia e bagliore proprio (calcolati dal seed),
+    distribuiti su TUTTO il fotogramma. I bassi allargano le orbite, gli acuti
+    aggiungono un tremolio rapido, i medi accelerano la deriva collettiva. Ogni
+    particella lascia una breve scia di movimento e luccica per conto suo (non
+    tutte in fase). Gli eventi eccitano solo la particella più vicina."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     duration = max(score["duration"], 1e-6)
 
-    n_particles = max(40, int(num_lanes) * 15)  # densità: riempie l'intera scena
-    base_x, base_y, freq_x, freq_y, phase, phase_y, radius = _swarm_params(int(score["seed"]), n_particles)
+    n_particles = max(40, int(num_lanes) * 15)
+    base_x, base_y, freq_x, freq_y, phase, phase_y, radius, size, tw_phase, tw_speed = \
+        _swarm_params(int(score["seed"]), n_particles)
 
     mosaic = score["band_mosaic"]
     mode, block_seconds = mosaic["mode"], mosaic["block_seconds"]
@@ -1790,18 +1794,38 @@ def render_frame_sciame(t, score, width=960, height=540, orientation="verticale"
     mid = _band_continuous_value(mosaic["mid"], mode, block_seconds, t)
     treble = _band_continuous_value(mosaic["treble"], mode, block_seconds, t)
 
-    radius_mod = radius * (0.5 + 1.4 * bass)
+    radius_mod = radius * (0.55 + 1.3 * bass)
     drift_speed = 1.0 + 1.2 * mid
-    jitter = 0.012 * treble * np.sin(t * 41.0 + phase * 17.0)
+    jitter = 0.02 * treble * np.sin(t * 41.0 + phase * 17.0)
 
-    x = base_x + radius_mod * np.cos(freq_x * 2 * np.pi * t * drift_speed + phase) + jitter
-    y = base_y + radius_mod * np.sin(freq_y * 2 * np.pi * t * drift_speed + phase_y)
-    px = np.clip(x, 0.0, 0.999) * width
-    py = np.clip(y, 0.0, 0.999) * height
+    def _positions(tt):
+        x = base_x + radius_mod * np.cos(freq_x * 2 * np.pi * tt * drift_speed + phase) + jitter
+        y = base_y + radius_mod * np.sin(freq_y * 2 * np.pi * tt * drift_speed + phase_y) + jitter
+        return np.clip(x, 0.0, 0.999) * width, np.clip(y, 0.0, 0.999) * height
 
-    base_gray = int(30 + bass * 20)
+    px, py = _positions(t)
+
+    # scia: 3 posizioni precedenti, sempre più deboli — rende visibile il
+    # movimento reale invece di punti fermi che appena tremolano
+    trail_dt = 0.045
+    for k in range(3, 0, -1):
+        tpx, tpy = _positions(t - k * trail_dt)
+        trail_alpha = 0.35 * (1.0 - k / 4.0)
+        gcol = int(70 * trail_alpha)
+        for i in range(n_particles):
+            r = max(1, int(size[i] * 0.6))
+            cv2.circle(frame, (int(tpx[i]), int(tpy[i])), r, (gcol, gcol, gcol), -1, cv2.LINE_AA)
+
+    # luccichio proprio per particella: non tutte alla stessa luminosità nello
+    # stesso istante, altrimenti lo sciame "respira" tutto insieme in modo innaturale
+    twinkle = 0.6 + 0.4 * np.sin(t * tw_speed + tw_phase)
+    base_level = 85 + bass * 60
     for i in range(n_particles):
-        cv2.circle(frame, (int(px[i]), int(py[i])), 1, (base_gray, base_gray, base_gray), -1, cv2.LINE_AA)
+        b = int(base_level * twinkle[i])
+        r = max(2, int(size[i]))
+        cx_i, cy_i = int(px[i]), int(py[i])
+        cv2.circle(frame, (cx_i, cy_i), r + 2, (b // 3, b // 3, b // 3), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx_i, cy_i), r, (b, b, b), -1, cv2.LINE_AA)
 
     SILENCE_THRESHOLD = 0.06
     gate_env = score.get("silence_envelope")
@@ -1817,17 +1841,18 @@ def render_frame_sciame(t, score, width=960, height=540, orientation="verticale"
         color = get_event_color(e, palette, band_colors)
 
         target_frac = min(0.999, max(0.0, _lane_fraction(e, position_mode)))
+        x_norm, y_norm = px / width, py / height
         if orientation == "orizzontale":
-            dist = np.abs(y - target_frac)
+            dist = np.abs(y_norm - target_frac)
         else:
-            dist = np.abs(x - target_frac)
+            dist = np.abs(x_norm - target_frac)
         idx = int(np.argmin(dist))
 
         cx_p, cy_p = int(px[idx]), int(py[idx])
-        r = max(2, int(3 + 10 * e["vel"] * fade))
+        r = max(4, int(6 + 16 * e["vel"] * fade))
         c = tuple(int(ch * fade) for ch in color)
         cv2.circle(frame, (cx_p, cy_p), r, c, -1, cv2.LINE_AA)
-        cv2.circle(frame, (cx_p, cy_p), r + 4, tuple(int(ch * fade * 0.5) for ch in color), 1, cv2.LINE_AA)
+        cv2.circle(frame, (cx_p, cy_p), r + 6, tuple(int(ch * fade * 0.5) for ch in color), 2, cv2.LINE_AA)
 
     return frame
 
