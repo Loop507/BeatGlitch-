@@ -162,6 +162,18 @@ MODULES = {
         "quote_en": "No point leads the others. They all breathe together, each on its own.",
         "hashtag": "#particleswarm #generativemotion",
     },
+    "13": {
+        "nome": "Matrice 13 — Grana",
+        "nome_en": "Matrix 13 — Grain",
+        "effetto": "Granular Fragmentation Field",
+        "processo": "Audio Granulare Esterno → Densità/Ampiezza/Brightness → Campo Fluido",
+        "processo_en": "External Granular Audio → Density/Amplitude/Brightness → Fluid Field",
+        "motore_tag": "pilotato dalla grana, non dal battito",
+        "motore_tag_en": "driven by the grain, not by the beat",
+        "quote": "Non e' un colpo a muovere l'immagine. E' quanto e' fitta la grana, in quell'istante.",
+        "quote_en": "It's not a hit that moves the image. It's how dense the grain is, in that instant.",
+        "hashtag": "#granularsynthesis #glitchbrutalista",
+    },
 }
 
 USURA_STATE_PATH = os.path.join(tempfile.gettempdir(), "beatglitch_usura_state.json")
@@ -688,6 +700,28 @@ def build_score(duration, seed, rule=30,
     automaton_steps = max(30, int((duration / beat_interval) * steps_per_beat))
     automaton_field = cellular_automaton(rule, width=140, steps=automaton_steps, seed=effective_seed + 909)
 
+    # modulo 13 (Grana): niente nuova analisi audio — solo una lettura diversa
+    # dei dati che il sistema estrae già. La densità istantanea dei grani è il
+    # conteggio degli onset (audio_events, già rilevati da extract_from_audio)
+    # per finestra temporale; la brightness spettrale è il rapporto acuti/(bassi+
+    # acuti) preso dagli stessi band_envelopes già calcolati per il mosaico Henke.
+    grain_density_env = None
+    if audio_events:
+        bins = np.linspace(0, duration, resolution + 1)
+        onset_times_arr = np.array([e["t"] for e in audio_events])
+        counts, _ = np.histogram(onset_times_arr, bins=bins)
+        grain_density_env = counts / (counts.max() + 1e-9)
+
+    brightness_env = None
+    if audio_band_envelopes is not None:
+        bass_src = audio_band_envelopes["bass"]
+        treble_src = audio_band_envelopes["treble"]
+        bass_r = np.interp(np.linspace(0, 1, resolution),
+                            np.linspace(0, 1, len(bass_src)), bass_src)
+        treble_r = np.interp(np.linspace(0, 1, resolution),
+                              np.linspace(0, 1, len(treble_src)), treble_src)
+        brightness_env = treble_r / (bass_r + treble_r + 1e-9)
+
     return {
         "duration": duration,
         "seed": effective_seed,
@@ -701,6 +735,8 @@ def build_score(duration, seed, rule=30,
         "automaton_field": automaton_field,
         "bpm": bpm,
         "beat_interval": beat_interval,
+        "grain_density_env": grain_density_env,
+        "brightness_env": brightness_env,
     }
 
 
@@ -1861,6 +1897,79 @@ def render_frame_sciame(t, score, width=960, height=540, orientation="verticale"
 # 5. GENERATORE AUDIO
 # ============================================================
 
+def _grana_envelope_at(env, t, duration):
+    """Campiona un inviluppo (array 1D) all'istante t, per interpolazione lineare
+    sull'intera durata — stesso principio usato altrove nel file, isolato qui
+    perché il modulo 13 lo usa tre volte per frame (ampiezza/densità/brightness)."""
+    if env is None or len(env) == 0 or duration <= 0:
+        return 0.0
+    times = np.linspace(0, duration, len(env))
+    return float(np.clip(np.interp(t, times, env), 0.0, 1.0))
+
+
+def _render_grana_base(t, score, width, height, palette, band_colors):
+    """Campo fluido 'pulito' del modulo 13, senza degrado: colore = brightness
+    spettrale della grana, intensità = ampiezza. Isolato dalla funzione pubblica
+    così il memory-frame (sotto) resta UNA sola chiamata extra, non una catena
+    ricorsiva — stesso principio di render_frame_ikeda dentro render_frame_jeck."""
+    duration = score["duration"]
+    seed = score["seed"]
+
+    amp = _grana_envelope_at(score.get("macro_envelope"), t, duration)
+    brightness = _grana_envelope_at(score.get("brightness_env"), t, duration)
+
+    setting = PALETTES.get(palette)
+    if setting == "BAND":
+        bc = band_colors or DEFAULT_BAND_COLORS
+        cold, warm = bc["bass"], bc["treble"]
+    elif setting is None:  # "Multicolore": blend procedurale freddo -> caldo
+        cold, warm = (35, 55, 170), (255, 205, 90)
+    else:
+        cold = tuple(int(c * 0.35) for c in setting)
+        warm = setting
+    base_color = tuple(int(c0 + (c1 - c0) * brightness) for c0, c1 in zip(cold, warm))
+
+    # onde morbide che scorrono nel tempo, spente quando l'ampiezza è bassa —
+    # è il "minimale/rarefatto" richiesto per texture rade
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    nx, ny = xx / width, yy / height
+    flow = 0.5 + 0.5 * (
+        np.sin(2 * np.pi * (2.5 * nx + 0.55 * t) + seed * 0.001)
+        * np.cos(2 * np.pi * (1.8 * ny - 0.35 * t))
+    )
+    field = 0.20 + 0.80 * amp * flow
+
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    for c in range(3):
+        frame[:, :, c] = np.clip(field * base_color[c], 0, 255).astype(np.uint8)
+    return frame
+
+
+def render_frame_grana(t, score, width=960, height=540, orientation="verticale",
+                        num_lanes=10, palette="Multicolore (per fonte)", band_colors=None):
+    """Modulo 13 (Grana): nessun evento discreto da disegnare — il frame nasce da
+    un campo fluido continuo che viene squarciato in proporzione alla densità
+    istantanea dei grani. Riusa DIRETTAMENTE il motore di degrado a strisce del
+    modulo Jeck (04): qui la 'usura' non è un contatore persistente ma la densità
+    della grana in quell'istante — texture rarefatta = quasi nessuna frammentazione,
+    grana fitta = tagli, aberrazione cromatica e rumore come negli altri moduli
+    distrutti."""
+    duration = score["duration"]
+    seed = score["seed"]
+    density = _grana_envelope_at(score.get("grain_density_env"), t, duration)
+
+    base = _render_grana_base(t, score, width, height, palette, band_colors)
+
+    memory_frame = None
+    if density > 0.0:
+        memory_delay = 0.3 + 1.2 * density
+        if memory_delay < t:
+            memory_frame = _render_grana_base(t - memory_delay, score, width, height,
+                                               palette, band_colors)
+
+    return apply_visual_degradation(base, t, seed, usura_level=density, memory_frame=memory_frame)
+
+
 def synthesize_audio_ikeda(score, sr=SR):
     duration = max(score["duration"], 0.1)
     N = int(duration * sr)
@@ -2501,6 +2610,46 @@ def synthesize_audio_sciame(score, sr=SR):
     return stereo
 
 
+def synthesize_audio_grana(score, sr=SR):
+    """Modulo 13: non c'è bisogno di un motore di sintesi elaborato — l'audio
+    'vero' resta la sintesi granulare caricata (selezionabile come 'Originale').
+    Ma restituire silenzio puro è una trappola: se l'utente dimentica di cambiare
+    la colonna sonora finale, si ritrova un video muto senza accorgersene prima
+    della fine del rendering. Qui invece genero un drone leggero pilotato dagli
+    STESSI inviluppi che guidano il video (ampiezza, brightness, densità) — così
+    anche il caso 'dimenticato' resta coerente con quello che si vede, invece di
+    essere un errore silenzioso."""
+    duration = max(score["duration"], 0.1)
+    N = int(duration * sr)
+    t_ax = np.linspace(0, duration, N)
+
+    def _resample(env, default):
+        if env is None or len(env) == 0:
+            return np.full(N, default)
+        return np.interp(t_ax, np.linspace(0, duration, len(env)), env)
+
+    amp_full = _resample(score.get("macro_envelope"), 0.3)
+    bright_full = _resample(score.get("brightness_env"), 0.4)
+    dens_full = _resample(score.get("grain_density_env"), 0.0)
+
+    # tono di base: la brightness spettrale della grana pilota l'altezza (più
+    # acuta la grana, più acuto il drone), l'ampiezza pilota il volume
+    freq = 70.0 + 250.0 * bright_full
+    phase_drone = 2 * np.pi * np.cumsum(freq) / sr
+    drone = np.sin(phase_drone) * (0.08 + 0.18 * amp_full)
+
+    # un filo di rumore smussato, pesato dalla densità istantanea: evoca la
+    # 'grana' anche nell'audio di scorta, senza dipendenze extra (scipy non
+    # serve — una media mobile con np.convolve basta ed è economica)
+    rng = np.random.RandomState(score["seed"] + 1301)
+    noise = rng.normal(0, 1, N).astype(np.float32)
+    noise_smooth = np.convolve(noise, np.ones(9) / 9.0, mode="same")
+    grain_noise = noise_smooth * dens_full * 0.12
+
+    mono = np.clip(drone + grain_noise, -1.0, 1.0).astype(np.float32)
+    return np.stack([mono, mono])
+
+
 def fit_audio_length(y, N):
     """Adatta un array audio (mono 1D o stereo (2,N)) alla lunghezza N (trim o loop)."""
     if y.ndim == 1:
@@ -2561,6 +2710,8 @@ def generate_text_report(params, score, module_id="01", brand="Loop507", vol=Non
         analisi.append("Recursive Tree Subdivision / Band-Driven Depth Growth")
     if module_id == "12":
         analisi.append("Independent Particle Orbits / FM Shimmer Synthesis")
+    if module_id == "13":
+        analisi.append("Grain Density Histogram / Spectral Brightness Ratio / Fluid Field Fragmentation")
 
     vol_num = vol if vol is not None else abs(score["seed"]) % 99
     n_frames = int(round(score["duration"] * FPS))
@@ -2699,11 +2850,13 @@ MODULE_FILENAME_BASE = f"beatglitch_matrice_engine_{module_id}"
 RENDER_FNS = {"01": render_frame_ikeda, "02": render_frame_henke, "03": render_frame_molnar,
               "04": render_frame_jeck, "05": render_frame_stocastico, "06": render_frame_automaton,
               "07": render_frame_datastream, "08": render_frame_oscilloscopio, "09": render_frame_rete,
-              "10": render_frame_radiale, "11": render_frame_ricorsiva, "12": render_frame_sciame}
+              "10": render_frame_radiale, "11": render_frame_ricorsiva, "12": render_frame_sciame,
+              "13": render_frame_grana}
 SYNTH_FNS = {"01": synthesize_audio_ikeda, "02": synthesize_audio_henke, "03": synthesize_audio_molnar,
              "04": synthesize_audio_jeck, "05": synthesize_audio_stocastico, "06": synthesize_audio_automaton,
              "07": synthesize_audio_datastream, "08": synthesize_audio_oscilloscopio, "09": synthesize_audio_rete,
-             "10": synthesize_audio_radiale, "11": synthesize_audio_ricorsiva, "12": synthesize_audio_sciame}
+             "10": synthesize_audio_radiale, "11": synthesize_audio_ricorsiva, "12": synthesize_audio_sciame,
+             "13": synthesize_audio_grana}
 render_frame_fn = RENDER_FNS[module_id]
 synthesize_audio_fn = SYNTH_FNS[module_id]
 
@@ -2749,6 +2902,15 @@ elif module_id == "12":
     st.caption("Modulo 12: uno sciame di particelle indipendenti riempie tutto il "
                "fotogramma. I bassi allargano le orbite, gli acuti aggiungono un "
                "tremolio; gli eventi eccitano solo la particella più vicina.")
+elif module_id == "13":
+    st.caption("Modulo 13: nessun evento discreto. Carica come 'Audio' (sidebar) il "
+               "file già trasformato in Fase 1 dal motore granulare di VIDEOSOUND_GEN — "
+               "il campo fluido reagisce ad ampiezza, brightness spettrale e densità "
+               "istantanea della grana: più fitta la grana, più il frame si frammenta. "
+               "Per sentire la texture granulare originale scegli 'Originale (file "
+               "caricato)' come colonna sonora finale — 'Generata (sintesi)' produce "
+               "comunque un drone leggero pilotato dagli stessi dati del video, non "
+               "silenzio.")
 
 
 
@@ -3181,7 +3343,7 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
-    else:
+    elif module_id == "12":
         # Modulo 12: le particelle hanno orbite fisse (dal seed), distribuite su
         # tutto il fotogramma. 'Numero di linee' qui regola la densità dello
         # sciame (particelle totali = valore x15).
@@ -3216,6 +3378,34 @@ with st.sidebar:
 
         grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
         show_source_legend = (palette == "Multicolore (per fonte)")
+    else:
+        # Modulo 13: nessuna corsia, nessun evento discreto — solo un campo
+        # fluido colorato dalla brightness spettrale della grana, frammentato in
+        # base alla sua densità istantanea. Niente controlli di orientamento/
+        # corsie: riuso solo la scelta della palette.
+        st.caption("Il campo non ha corsie né eventi discreti: colore e "
+                   "frammentazione seguono solo l'audio granulare caricato.")
+        usa_banda_13 = st.checkbox("Colori bassi/alti come freddo/caldo", value=False, key="banda_toggle_13")
+        band_colors = None
+        if usa_banda_13:
+            palette = "Per banda (bassi/medi/alti)"
+            c_bassi_13 = st.color_picker("Bassi (freddo)", "#2337AA", key="grana_bassi")
+            c_alti_13 = st.color_picker("Alti (caldo)", "#FFCD5A", key="grana_alti")
+
+            def _hex_to_rgb(h):
+                h = h.lstrip("#")
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+            band_colors = {"bass": _hex_to_rgb(c_bassi_13), "mid": _hex_to_rgb(c_alti_13),
+                            "treble": _hex_to_rgb(c_alti_13)}
+        else:
+            palette_options_13 = [k for k in PALETTES.keys() if k != "Per banda (bassi/medi/alti)"]
+            palette = st.selectbox("Palette colore", palette_options_13, key="palette_13")
+
+        orientamento, num_lanes = "verticale", 10
+        grid_cols, accent_color, deviation_sensitivity, deviation_min_gap = 10, (235, 40, 60), 0.6, 1.0
+        position_mode = "pan"
+        show_source_legend = False
 
 # ------------------------------------------------------------
 # ESTRAZIONE — ogni input presente alimenta un ruolo diverso
